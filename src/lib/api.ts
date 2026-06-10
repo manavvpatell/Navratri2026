@@ -5,21 +5,7 @@
 
 import { Booking, AuditLog, UserNotification, NavratriDay } from "../types";
 import { INITIAL_NAVRATRI_DAYS } from "./data";
-import { db, auth } from "./firebase";
-import { 
-  collection, 
-  doc, 
-  getDocs, 
-  getDoc, 
-  setDoc, 
-  updateDoc, 
-  addDoc, 
-  query, 
-  where, 
-  orderBy, 
-  limit, 
-  onSnapshot 
-} from "firebase/firestore";
+import { auth } from "./firebase";
 import { signInWithPopup, GoogleAuthProvider, signOut, User } from "firebase/auth";
 
 export enum OperationType {
@@ -83,6 +69,34 @@ class NavratriApiService {
   }
 
   // Auth Operations
+  async register(name: string, email: string, password: string): Promise<any> {
+    const res = await fetch(`${this.baseUri}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, email, password })
+    });
+    if (res.ok) {
+      return await res.json();
+    } else {
+      const errorData = await res.json();
+      throw new Error(errorData.message || "Registration failed.");
+    }
+  }
+
+  async login(email: string, password: string): Promise<any> {
+    const res = await fetch(`${this.baseUri}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+    if (res.ok) {
+      return await res.json();
+    } else {
+      const errorData = await res.json();
+      throw new Error(errorData.message || "Login failed.");
+    }
+  }
+
   async loginWithGoogle(): Promise<User> {
     try {
       const provider = new GoogleAuthProvider();
@@ -94,6 +108,28 @@ class NavratriApiService {
       console.error("Auth: Google login failed", err);
       throw err;
     }
+  }
+
+  async loginSimulated(role: "admin" | "user"): Promise<any> {
+    const mockUser = role === "admin" ? {
+      uid: "mock-admin-id",
+      email: "manavgameium@gmail.com",
+      displayName: "Manav Organizer",
+      photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=Manav"
+    } : {
+      uid: "mock-user-id",
+      email: "guest@gmail.com",
+      displayName: "Festive Guest",
+      photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=Festive"
+    };
+
+    try {
+      // Log in database
+      await this.logActivity("AUTH_SIMULATED_SUCCESS", `Logged in as Simulated ${role === "admin" ? "Admin" : "User"}`, mockUser.email);
+    } catch (e) {
+      console.warn("Could not log simulated auth activity to server.");
+    }
+    return mockUser;
   }
 
   async logout(): Promise<void> {
@@ -130,22 +166,16 @@ class NavratriApiService {
     localStorage.setItem("navratri_bookings_cache", JSON.stringify(list));
   }
 
-  // Log activity helper that writes to Firestore /audit_logs
+  // Log activity helper that writes to backend REST API
   private async logActivity(action: string, details: string, email: string = "system") {
-    const logId = "LOG-C-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6);
-    const logData: AuditLog = {
-      id: logId,
-      timestamp: new Date().toISOString(),
-      level: "info",
-      event: action,
-      details,
-      email
-    };
-
     try {
-      await setDoc(doc(db, "audit_logs", logId), logData);
+      await fetch(`${this.baseUri}/logs/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, details, email })
+      });
     } catch (err) {
-      console.warn("Could not write audit log directly to Firestore. Storing locally.", err);
+      console.warn("Could not save client audit log on server.", err);
     }
   }
 
@@ -153,23 +183,6 @@ class NavratriApiService {
 
   // Fetches current Garba capacity days
   async getDays(): Promise<NavratriDay[]> {
-    try {
-      const snap = await getDocs(collection(db, "capacity_state"));
-      const list: NavratriDay[] = [];
-      snap.forEach((docSnap) => {
-        list.push(docSnap.data() as NavratriDay);
-      });
-      if (list.length > 0) {
-        // Sort by day number
-        list.sort((a, b) => a.day - b.day);
-        this.saveLocalDays(list);
-        return list;
-      }
-    } catch (e) {
-      console.warn("Firestore: getDays failed or unprovisioned. Querying server fallback.", e);
-    }
-
-    // Server API Fallback
     try {
       const res = await fetch(`${this.baseUri}/days`);
       if (res.ok) {
@@ -185,7 +198,6 @@ class NavratriApiService {
 
   // Initiates ticket order (Razorpay prep step)
   async createOrder(name: string, email: string, phone: string, day: number) {
-    // Standard secure server checkout to prevent client-side capacity breaches
     try {
       const res = await fetch(`${this.baseUri}/payment/create-order`, {
         method: "POST",
@@ -199,41 +211,8 @@ class NavratriApiService {
         throw new Error(errorData.message || "Failed to generate checkout order.");
       }
     } catch (e: any) {
-      console.warn("API: createOrder failed, engaging local checkout.", e);
-      
-      const localDays = this.getLocalDays();
-      const target = localDays.find(d => d.day === day);
-      if (!target) throw new Error("Festival night selection not registered.");
-      
-      if (target.maxCapacity - target.currentCapacity <= 0) {
-        throw new Error("This Garba night has sold out!");
-      }
-
-      const orderId = "order_offline_" + Math.random().toString(36).substring(2, 10).toUpperCase();
-      const amount = target.price;
-      
-      const newBooking: Booking = {
-        id: "PASS-" + Math.random().toString(36).substring(2, 8).toUpperCase(),
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim(),
-        day,
-        ticketHash: "",
-        status: "pending",
-        amount,
-        orderId,
-        createdAt: new Date().toISOString()
-      };
-      
-      this.saveLocalBooking(newBooking);
-      return {
-        success: true,
-        orderId,
-        amount,
-        currency: "INR",
-        dayDetails: target,
-        isOfflineMode: true
-      };
+      console.warn("API: createOrder failed.", e);
+      throw e;
     }
   }
 
@@ -253,80 +232,33 @@ class NavratriApiService {
         return data;
       }
     } catch (e) {
-      console.warn("API: verifyPayment server offline, completing offline transaction sync.", e);
+      console.warn("API: verifyPayment failed.", e);
     }
-
-    // Local checkout safety flow
-    const list = this.getLocalBookings();
-    const b = list.find(item => item.orderId === orderId);
-    if (!b) throw new Error("Purchase order tracking reference missing during verification.");
-
-    if (b.status !== "pending") return { success: true, booking: b };
-
-    if (status === "failed") {
-      b.status = "failed";
-      this.saveLocalBooking(b);
-      return { success: false, message: "Payment authorization aborted." };
-    }
-
-    const localDays = this.getLocalDays();
-    const target = localDays.find(d => d.day === b.day);
-    if (!target) throw new Error("Target Night parameters corrupted.");
-
-    if (target.maxCapacity - target.currentCapacity <= 0) {
-      b.status = "failed";
-      this.saveLocalBooking(b);
-      throw new Error("We apologize—this night sold out during the verification interval.");
-    }
-
-    // Save ticket with generated credentials
-    target.currentCapacity += 1;
-    this.saveLocalDays(localDays);
-
-    b.status = "success";
-    b.paymentId = paymentId || "pay_off_" + Math.random().toString(36).substring(2, 10).toUpperCase();
-    b.paymentSignature = signature || "sig_off_" + Math.random().toString(36).substring(2, 14).toUpperCase();
-    b.ticketHash = "GARBA-OFF-" + Math.random().toString(36).substring(2, 12).toUpperCase() + "-" + b.day;
-    b.isScanned = false;
-
-    this.saveLocalBooking(b);
-
-    // Sync to Firestore if signed in
-    try {
-      await setDoc(doc(db, "bookings", b.id), b);
-    } catch (err) {
-      console.warn("Failed to backup booking ticket directly to Firestore.", err);
-    }
-
-    return {
-      success: true,
-      booking: b,
-      dayDetails: target,
-      isOfflineMode: true
-    };
+    return { success: false, message: "Verify transaction failed." };
   }
 
-  // Fetches audit logs from Firestore
+  // Fetches audit logs from server
   async getAuditLogs(): Promise<AuditLog[]> {
-    try {
-      const q = query(collection(db, "audit_logs"), orderBy("timestamp", "desc"), limit(60));
-      const snap = await getDocs(q);
-      const list: AuditLog[] = [];
-      snap.forEach((docSnap) => {
-        list.push(docSnap.data() as AuditLog);
-      });
-      return list;
-    } catch (e) {
-      console.warn("Firestore: getAuditLogs failed. Accessing backend REST fallback.", e);
-    }
-
     try {
       const res = await fetch(`${this.baseUri}/logs`);
       if (res.ok) {
         return await res.json();
       }
     } catch (e) {
-      console.warn("API: getAuditLogs failed, returning empty default.");
+      console.warn("API: getAuditLogs failed.", e);
+    }
+    return [];
+  }
+
+  // Fetches all bookings for administrator views
+  async getAllBookings(): Promise<Booking[]> {
+    try {
+      const res = await fetch(`${this.baseUri}/bookings`);
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn("API: getAllBookings failed.", e);
     }
     return [];
   }
@@ -339,102 +271,18 @@ class NavratriApiService {
         return await res.json();
       }
     } catch (e) {
-      console.warn("API: getDashboardStats failed, calculating stats from Firestore nodes.", e);
+      console.warn("API: getDashboardStats failed.", e);
     }
-
-    // Direct Firestore Calculation
-    try {
-      const bookingsSnap = await getDocs(collection(db, "bookings"));
-      const daysSnap = await getDocs(collection(db, "capacity_state"));
-      
-      const bookingsList: Booking[] = [];
-      bookingsSnap.forEach((d) => {
-        const b = d.data() as Booking;
-        if (b.status === "success") bookingsList.push(b);
-      });
-
-      const daysList: NavratriDay[] = [];
-      daysSnap.forEach((d) => {
-        daysList.push(d.data() as NavratriDay);
-      });
-
-      const totalPayments = bookingsList.reduce((sum, b) => sum + b.amount, 0);
-      const totalRegistrations = bookingsList.length;
-
-      const dailyStats = daysList.map(d => ({
-        day: d.day,
-        devi: d.devi,
-        sold: d.currentCapacity,
-        max: d.maxCapacity,
-        revenue: bookingsList.filter(b => b.day === d.day).reduce((sum, b) => sum + b.amount, 0)
-      }));
-
-      return {
-        totalPayments,
-        totalRegistrations,
-        dailyStats,
-        activeUsersSimulated: 15
-      };
-
-    } catch (err) {
-      console.warn("Firestore count calculation failed. Evaluating local offline cache.", err);
-    }
-
-    // Local offline default calculations
-    const bookingsList = this.getLocalBookings().filter(b => b.status === "success");
-    const localDays = this.getLocalDays();
-
-    const totalPayments = bookingsList.reduce((sum, b) => sum + b.amount, 0);
-    const totalRegistrations = bookingsList.length;
-
-    const dailyStats = localDays.map(d => ({
-      day: d.day,
-      devi: d.devi,
-      sold: d.currentCapacity,
-      max: d.maxCapacity,
-      revenue: bookingsList.filter(b => b.day === d.day).reduce((sum, b) => sum + b.amount, 0)
-    }));
-
     return {
-      totalPayments,
-      totalRegistrations,
-      dailyStats,
+      totalPayments: 0,
+      totalRegistrations: 0,
+      dailyStats: [],
       activeUsersSimulated: 5
     };
   }
 
   // Publishes custom notifications (push updates) from administrator
   async announceVenueUpdate(title: string, body: string, type: "update" | "success" | "alert" | "info" = "update") {
-    const notifId = "NOTIF-W-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6);
-    const notifData: UserNotification = {
-      id: notifId,
-      title,
-      body,
-      type,
-      timestamp: new Date().toISOString(),
-      read: false
-    };
-
-    // Attempt direct Firestore write
-    try {
-      await setDoc(doc(db, "notifications", notifId), notifData);
-      
-      // Log broadcast alert
-      const email = auth.currentUser?.email || "admin@navratri2026.com";
-      const logId = "LOG-C-" + Date.now();
-      await setDoc(doc(db, "audit_logs", logId), {
-        id: logId,
-        timestamp: new Date().toISOString(),
-        level: "security",
-        event: "ADMIN_BROADCAST",
-        details: `Direct Broadcast: ${title}`,
-        email
-      });
-      return { success: true, notification: notifData };
-    } catch (err) {
-      console.warn("Direct Firestore announcement write failed. Resorting to REST fallback.", err);
-    }
-
     try {
       const res = await fetch(`${this.baseUri}/notifications/announce`, {
         method: "POST",
@@ -445,65 +293,13 @@ class NavratriApiService {
         return await res.json();
       }
     } catch (e) {
-      console.warn("API: announceVenueUpdate failed, committing to offline notification feed.");
+      console.warn("API: announceVenueUpdate failed.");
     }
-
-    return { success: true, notification: notifData };
+    return { success: false, message: "Server connection failed." };
   }
 
   // Validates a ticket via its unique QR/Barcode hash
   async verifyQrAtGate(qrHash: string) {
-    // We can directly scan and validate the ticket inside Firestore under Rules authorization!
-    try {
-      const bookingsRef = collection(db, "bookings");
-      const q = query(bookingsRef, where("ticketHash", "==", qrHash), limit(1));
-      const snap = await getDocs(q);
-      
-      if (!snap.empty) {
-        const bookingDoc = snap.docs[0];
-        const bookingData = bookingDoc.data() as Booking;
-
-        if (bookingData.isScanned) {
-          // Log security error
-          const logId = "LOG-QR-" + Date.now();
-          await setDoc(doc(db, "audit_logs", logId), {
-            id: logId,
-            timestamp: new Date().toISOString(),
-            level: "security",
-            event: "REDUNDANT_QR_SCAN",
-            details: `Counterfeit alert! Duplicate check-in scan for ID ${bookingData.id}`,
-            email: "gate_scanner"
-          });
-          return { success: false, message: "This pass has already been checked in. Security alert triggered." };
-        }
-
-        // Atomically check-in
-        await updateDoc(doc(db, "bookings", bookingData.id), {
-          isScanned: true
-        });
-
-        // Log confirmation
-        const logId = "LOG-QR-" + Date.now();
-        await setDoc(doc(db, "audit_logs", logId), {
-          id: logId,
-          timestamp: new Date().toISOString(),
-          level: "info",
-          event: "GATE_TICKET_VALIDATED",
-          details: `Ticket ID ${bookingData.id} checked-in successfully (Direct Firestore).`,
-          email: "gate_scanner"
-        });
-
-        const refreshedDoc = await getDoc(doc(db, "bookings", bookingData.id));
-        return {
-          success: true,
-          message: "Pass fully validated via Firestore. Welcome to Navratri 2026!",
-          booking: refreshedDoc.data() as Booking
-        };
-      }
-    } catch (err) {
-      console.warn("Direct Firestore QR validation failed. Resorting to REST fallback.", err);
-    }
-
     try {
       const res = await fetch(`${this.baseUri}/bookings/verify-qr`, {
         method: "POST",
@@ -514,97 +310,17 @@ class NavratriApiService {
         return await res.json();
       }
     } catch (e) {
-      console.warn("API: verifyQrAtGate failed, validating on local cache.", e);
+      console.warn("API: verifyQrAtGate failed.", e);
     }
-
-    const bookingsList = this.getLocalBookings();
-    const match = bookingsList.find(b => b.ticketHash === qrHash);
-
-    if (!match) {
-      return { success: false, message: "Unauthorized ticket pass. Verification failed." };
-    }
-
-    if (match.isScanned) {
-      return { success: false, message: "This pass has already been checked in. Security alert triggered." };
-    }
-
-    match.isScanned = true;
-    localStorage.setItem("navratri_bookings_cache", JSON.stringify(bookingsList));
-
-    return {
-      success: true,
-      message: "Pass fully validated (Offline Backup). Welcome to Navratri 2026!",
-      booking: match
-    };
+    return { success: false, message: "Gate Scanner: Server transaction timeout." };
   }
 
-  // Listens to real-time events via Live Firestore Sync
+  // Listens to real-time events via Live Server SSE Stream
   connectSseStream(
     onMessage: (type: string, data: any) => void,
     onStatusChange?: (connected: boolean) => void
   ): { close: () => void } {
-    let unsubs: (() => void)[] = [];
-    let sseConnected = true;
-
-    try {
-      // 1. Subscribe to capacity updates in Firestore
-      const unsubCap = onSnapshot(collection(db, "capacity_state"), (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          const item = change.doc.data() as NavratriDay;
-          onMessage("capacity_update", {
-            day: item.day,
-            currentCapacity: item.currentCapacity
-          });
-        });
-      }, (error) => {
-        console.warn("Firestore Snapshot: capacity_state listening issue.", error);
-      });
-      unsubs.push(unsubCap);
-
-      // 2. Subscribe to real-time announcements
-      const qNotif = query(collection(db, "notifications"), orderBy("timestamp", "desc"), limit(25));
-      const unsubNotif = onSnapshot(qNotif, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === "added") {
-            onMessage("notification", change.doc.data());
-          }
-        });
-      }, (error) => {
-        console.warn("Firestore Snapshot: notifications listening issue.", error);
-      });
-      unsubs.push(unsubNotif);
-
-      // 3. Subscribe to real-time audit logs
-      const qLogs = query(collection(db, "audit_logs"), orderBy("timestamp", "desc"), limit(50));
-      const unsubLogs = onSnapshot(qLogs, (snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === "added") {
-            onMessage("audit_log", change.doc.data());
-          }
-        });
-      }, (error) => {
-        console.warn("Firestore Snapshot: audit_logs listening issue.", error);
-      });
-      unsubs.push(unsubLogs);
-
-      if (onStatusChange) onStatusChange(true);
-
-    } catch (err) {
-      console.warn("Direct Firestore streaming failed, rolling over to backend SSE Stream", err);
-      sseConnected = false;
-    }
-
-    if (sseConnected) {
-      return {
-        close: () => {
-          unsubs.forEach((unsub) => unsub());
-        }
-      };
-    }
-
-    // REST SSE Stream Fallback if Firestore connection completely fails
     let sse: EventSource | null = null;
-    let fallbackTimer: NodeJS.Timeout | null = null;
 
     const establish = () => {
       try {
@@ -623,19 +339,9 @@ class NavratriApiService {
         sse.onerror = () => {
           if (onStatusChange) onStatusChange(false);
           if (sse) sse.close();
-          if (!fallbackTimer) {
-            fallbackTimer = setInterval(() => {
-              this.simulateRealtimeUpdates(onMessage);
-            }, 8000);
-          }
         };
       } catch (err) {
         if (onStatusChange) onStatusChange(false);
-        if (!fallbackTimer) {
-          fallbackTimer = setInterval(() => {
-            this.simulateRealtimeUpdates(onMessage);
-          }, 8000);
-        }
       }
     };
 
@@ -644,28 +350,8 @@ class NavratriApiService {
     return {
       close: () => {
         if (sse) sse.close();
-        if (fallbackTimer) clearInterval(fallbackTimer);
       }
     };
-  }
-
-  // Backup loop simulator
-  private simulateRealtimeUpdates(onMessage: (type: string, data: any) => void) {
-    const localDays = this.getLocalDays();
-    if (localDays.length === 0) return;
-    
-    const luckyDayIdx = Math.floor(Math.random() * localDays.length);
-    const dayObj = localDays[luckyDayIdx];
-
-    if (dayObj.currentCapacity < dayObj.maxCapacity - 15 && Math.random() > 0.85) {
-      dayObj.currentCapacity += 1;
-      this.saveLocalDays(localDays);
-
-      onMessage("capacity_update", {
-        day: dayObj.day,
-        currentCapacity: dayObj.currentCapacity
-      });
-    }
   }
 }
 

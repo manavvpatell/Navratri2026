@@ -27,6 +27,7 @@ export default function App() {
   // Application Primary states
   const [days, setDays] = useState<NavratriDay[]>(INITIAL_NAVRATRI_DAYS);
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [adminBookings, setAdminBookings] = useState<Booking[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [notifications, setNotifications] = useState<UserNotification[]>([]);
   const [sseConnected, setSseConnected] = useState(false);
@@ -43,9 +44,77 @@ export default function App() {
   const [activeAnnouncement, setActiveAnnouncement] = useState<UserNotification | null>(null);
   const [activeOrder, setActiveOrder] = useState<any | null>(null);
   const [showGateway, setShowGateway] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authTab, setAuthTab] = useState<"signin" | "signup">("signin");
+  const [authName, setAuthName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSuccessMsg, setAuthSuccessMsg] = useState<string | null>(null);
+
+  // Video settings states
+  const [videoUrl, setVideoUrl] = useState<string>(
+    localStorage.getItem("navratri_festival_video") || 
+    "https://assets.mixkit.co/videos/preview/mixkit-bright-gold-particles-in-motion-background-40748-large.mp4"
+  );
+  const [videoZoom, setVideoZoom] = useState<number>(
+    parseFloat(localStorage.getItem("navratri_festival_video_zoom") || "1.15")
+  );
+  const [videoOffset, setVideoOffset] = useState<number>(
+    parseFloat(localStorage.getItem("navratri_festival_video_offset") || "-30")
+  );
+
+  // Intro splash screen state
+  const [showIntro, setShowIntro] = useState(true);
+  const introVideoRef = useRef<HTMLVideoElement>(null);
+  const mainVideoRef = useRef<HTMLVideoElement>(null);
+
+  // Auto/Force play video loops to bypass strict browser policies
+  useEffect(() => {
+    const triggerIntroPlay = async () => {
+      if (showIntro && introVideoRef.current) {
+        try {
+          await introVideoRef.current.play();
+        } catch (e) {
+          console.debug("Intro video autoplay postponed until interaction:", e);
+        }
+      }
+    };
+    triggerIntroPlay();
+  }, [showIntro]);
+
+  useEffect(() => {
+    const triggerMainPlay = async () => {
+      if (!showIntro && mainVideoRef.current) {
+        try {
+          await mainVideoRef.current.play();
+        } catch (e) {
+          console.debug("Main video autoplay postponed until interaction:", e);
+        }
+      }
+    };
+    triggerMainPlay();
+  }, [showIntro]);
 
   // Announcement Timeout
   const announcementTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Sync email input ref to avoid stale closure during real-time stream subscription
+  const emailInputRef = useRef(emailInput);
+  useEffect(() => {
+    emailInputRef.current = emailInput;
+  }, [emailInput]);
+
+  // Load all admin bookings when logged in as admin
+  useEffect(() => {
+    if (user && user.email === "satrang2026@gmail.com") {
+      api.getAllBookings().then((all) => {
+        if (all) setAdminBookings(all);
+      });
+    } else {
+      setAdminBookings([]);
+    }
+  }, [user]);
 
   // Retrieve initial states from full-stack APIs
   useEffect(() => {
@@ -53,14 +122,23 @@ export default function App() {
 
     // Listen to Firebase authentication state dynamically
     const unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser) => {
-      setUser(firebaseUser);
       if (firebaseUser) {
+        setUser(firebaseUser);
         setEmailInput(firebaseUser.email || "");
         if (firebaseUser.displayName) {
           setFullName(firebaseUser.displayName);
         }
       } else {
-        setUser(null);
+        // Fallback to simulated local user if present
+        const storedSim = localStorage.getItem("simulated_user");
+        if (storedSim) {
+          const parsed = JSON.parse(storedSim);
+          setUser(parsed);
+          setEmailInput(parsed.email || "");
+          setFullName(parsed.displayName || "");
+        } else {
+          setUser(null);
+        }
       }
     });
 
@@ -84,6 +162,35 @@ export default function App() {
           }, 8000);
         } else if (type === "audit_log") {
           setAuditLogs((prev) => [data, ...prev]);
+        } else if (type === "booking_update") {
+          // Sync admin records in real time
+          setAdminBookings((prev) => {
+            const exists = prev.some((b) => b.id === data.id);
+            if (exists) {
+              return prev.map((b) => (b.id === data.id ? data : b));
+            } else {
+              return [data, ...prev];
+            }
+          });
+
+          // Sync user client cache if email matches current user
+          const cached = JSON.parse(localStorage.getItem("navratri_bookings_cache") || "[]");
+          const isMine = (data.email && emailInputRef.current && data.email.toLowerCase() === emailInputRef.current.toLowerCase()) || 
+                          cached.some((b: Booking) => b.id === data.id);
+          
+          if (isMine) {
+            setBookings((prev) => {
+              const exists = prev.some((b) => b.id === data.id);
+              let updated;
+              if (exists) {
+                updated = prev.map((b) => (b.id === data.id ? data : b));
+              } else {
+                updated = [data, ...prev];
+              }
+              localStorage.setItem("navratri_bookings_cache", JSON.stringify(updated));
+              return updated;
+            });
+          }
         }
       },
       (isConnected) => {
@@ -108,8 +215,133 @@ export default function App() {
       setDays(daysList);
       const logs = await api.getAuditLogs();
       setAuditLogs(logs);
+      if (user && user.email === "satrang2026@gmail.com") {
+        const allBookings = await api.getAllBookings();
+        if (allBookings) setAdminBookings(allBookings);
+      }
     } catch (e) {
       console.warn("Could not query initial database. Using browser local states.");
+    }
+  };
+
+  const handleEnterCelebration = () => {
+    setShowIntro(false);
+    triggerAccessibilityAnnouncement("Entering the primary reservation dashboard. Welcome!");
+    confetti({
+      particleCount: 180,
+      spread: 90,
+      origin: { y: 0.65 },
+      colors: ["#D12E6B", "#F59E0B", "#139D9E", "#FFFFFF"]
+    });
+  };
+
+  const handleLogout = async () => {
+    localStorage.removeItem("simulated_user");
+    await api.logout();
+    setUser(null);
+    setEmailInput("");
+    setFullName("");
+    setAdminBookings([]);
+  };
+
+  const handleCustomLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSuccessMsg(null);
+
+    const trimmedEmail = authEmail.trim();
+    if (!trimmedEmail || !authPassword) {
+      setAuthError("Email and Password are both required.");
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      setAuthError("Please enter a valid email address format (e.g., user@example.com).");
+      return;
+    }
+
+    try {
+      const response = await api.login(trimmedEmail, authPassword);
+      if (response && response.success && response.user) {
+        localStorage.setItem("simulated_user", JSON.stringify(response.user));
+        setUser(response.user);
+        setEmailInput(response.user.email || "");
+        if (response.user.displayName) {
+          setFullName(response.user.displayName);
+        }
+        setAuthSuccessMsg(response.message || "Logged in successfully!");
+        
+        // Reset state
+        setAuthEmail("");
+        setAuthPassword("");
+        setAuthName("");
+
+        // Close after a brief delay
+        setTimeout(() => {
+          setShowAuthModal(false);
+          setAuthSuccessMsg(null);
+        }, 1200);
+      } else {
+        setAuthError(response.message || "Login failed. Check your details.");
+      }
+    } catch (err: any) {
+      setAuthError(err.message || "Invalid credentials. Please register or try again.");
+    }
+  };
+
+  const handleCustomRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSuccessMsg(null);
+
+    const trimmedName = authName.trim();
+    const trimmedEmail = authEmail.trim();
+
+    if (!trimmedName || !trimmedEmail || !authPassword) {
+      setAuthError("Full Name, Email and Password are all required.");
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      setAuthError("Please enter a valid email address format (e.g., user@example.com).");
+      return;
+    }
+
+    try {
+      const response = await api.register(trimmedName, trimmedEmail, authPassword);
+      if (response && response.success) {
+        setAuthSuccessMsg(response.message || "Registration completed! Please Sign In below.");
+        setAuthTab("signin");
+        setAuthPassword("");
+        setAuthName("");
+        setAuthError(null);
+      } else {
+        setAuthError(response.message || "Registration failed.");
+      }
+    } catch (err: any) {
+      setAuthError(err.message || "Registration failed. Try a different email address.");
+    }
+  };
+
+  const handleLoginRole = async (role: "admin" | "user", method: "google" | "demo") => {
+    try {
+      if (method === "google") {
+        const loggedUser = await api.loginWithGoogle();
+        setUser(loggedUser);
+        setEmailInput(loggedUser.email || "");
+        setFullName(loggedUser.displayName || "");
+      } else {
+        const simulatedUser = await api.loginSimulated(role);
+        localStorage.setItem("simulated_user", JSON.stringify(simulatedUser));
+        setUser(simulatedUser);
+        setEmailInput(simulatedUser.email || "");
+        setFullName(simulatedUser.displayName || "");
+      }
+      setShowAuthModal(false);
+    } catch (err) {
+      console.error("Auth role matching failed: ", err);
     }
   };
 
@@ -193,6 +425,138 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#FAF6F0] text-[#3C2D24] font-sans relative antialiased overflow-x-hidden">
       
+      {/* Cinematic Ambient Intro Splash Screen Overlay */}
+      <AnimatePresence>
+        {showIntro && (
+          <motion.div
+            key="cinematic-festival-intro"
+            initial={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 1.05, filter: "blur(12px)" }}
+            transition={{ duration: 0.8, ease: [0.43, 0.13, 0.23, 0.96] }}
+            className="fixed inset-0 z-[120] bg-gradient-to-b from-[#110B29] to-[#050212] flex flex-col items-center justify-center p-4 overflow-hidden select-none"
+          >
+            {/* Spinning Mandala background watermarker */}
+            <div className="absolute inset-0 flex items-center justify-center opacity-10 pointer-events-none select-none overflow-hidden scale-110 md:scale-100">
+              <svg className="w-[600px] h-[600px] text-amber-500 animate-[spin_120s_linear_infinite]" viewBox="0 0 100 100" fill="none" stroke="currentColor" strokeWidth="0.15">
+                <circle cx="50" cy="50" r="45" />
+                <circle cx="50" cy="50" r="35" strokeDasharray="3,3" />
+                {Array.from({ length: 36 }).map((_, i) => (
+                  <line
+                    key={i}
+                    x1="50"
+                    y1="50"
+                    x2={50 + 45 * Math.cos((i * 10 * Math.PI) / 180)}
+                    y2={50 + 45 * Math.sin((i * 10 * Math.PI) / 180)}
+                  />
+                ))}
+              </svg>
+            </div>
+
+            {/* Immersive Full Screen Background Video player */}
+            <div className="absolute inset-0 w-full h-full object-cover z-0 overflow-hidden opacity-40">
+              <video
+                ref={introVideoRef}
+                key={videoUrl}
+                className="w-full h-full object-cover pointer-events-none select-none"
+                style={{
+                  width: `${videoZoom * 100}%`,
+                  height: `${videoZoom * 100}%`,
+                  transform: `translateY(${videoOffset}px)`
+                }}
+                autoPlay
+                loop
+                muted
+                playsInline
+                referrerPolicy="no-referrer"
+                crossOrigin="anonymous"
+              >
+                <source src={videoUrl} type="video/mp4" referrerPolicy="no-referrer" />
+                <source src="https://assets.mixkit.co/videos/preview/mixkit-bright-gold-particles-in-motion-background-40748-large.mp4" type="video/mp4" referrerPolicy="no-referrer" />
+                <source src="https://cdn.pixabay.com/video/2020/09/16/50548-462194917_large.mp4" type="video/mp4" referrerPolicy="no-referrer" />
+                Your browser does not support HTML5 video loops.
+              </video>
+            </div>
+
+            {/* Dark Golden Gradient Mask Overlay */}
+            <div className="absolute inset-0 bg-gradient-to-t from-[#050212] via-black/45 to-transparent pointer-events-none z-10" />
+
+            {/* Centered Traditional Experiential Greeting Card */}
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0, y: 30 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              transition={{ delay: 0.2, duration: 0.8, ease: "easeOut" }}
+              className="relative w-full max-w-xl bg-white/[0.03] backdrop-blur-md rounded-[32px] border-2 border-amber-500/25 p-8 md:p-12 text-center shadow-[0_0_50px_rgba(245,158,11,0.15)] z-20 flex flex-col items-center space-y-6 md:space-y-8"
+              id="cinematic-card-container"
+            >
+              {/* Marigold Garland / Lighted Clay Flame decoration overlay */}
+              <div className="flex items-center gap-1.5 justify-center text-amber-500 animate-pulse">
+                <Sparkles className="w-5 h-5 fill-amber-500" />
+                <span className="text-xs font-mono font-black tracking-[0.25em] uppercase text-amber-400">
+                  SHREE DURGAYAI NAMAH
+                </span>
+                <Sparkles className="w-5 h-5 fill-amber-500" />
+              </div>
+
+              {/* Sanskrit Traditional Shloka / Invocation Header */}
+              <div className="space-y-1 select-none">
+                <p className="font-serif text-[#FAF6F0] text-xs md:text-sm font-semibold tracking-wide italic leading-normal">
+                  "माँ दुर्गा के पावन पर्व नवरात्रि की हार्दिक शुभकामनाएं"
+                </p>
+                <div className="h-[1px] w-28 bg-gradient-to-r from-transparent via-amber-500/50 to-transparent mx-auto mt-2" />
+              </div>
+
+              {/* Grand Main Festival Header */}
+              <div className="space-y-2.5">
+                <h1 className="text-3xl md:text-5xl font-serif font-black tracking-tight text-white leading-tight drop-shadow-md">
+                  Dandiya Raas <br />
+                  <span className="bg-gradient-to-r from-amber-400 via-rose-500 to-[#D12E6B] bg-clip-text text-transparent">
+                    & Garba Mahotsav
+                  </span>
+                </h1>
+                <p className="text-amber-500/80 uppercase font-mono text-[10px] md:text-xs font-bold tracking-[0.3em] mt-1.5">
+                  The Celestial Nine Nights of Divine Grace • 2026
+                </p>
+              </div>
+
+              {/* Premium Highlights Grid */}
+              <div className="grid grid-cols-2 gap-4 w-full text-left pt-2 md:pt-4">
+                <div className="p-4 rounded-2xl bg-white/[0.04] border border-white/5 space-y-1">
+                  <span className="text-[10px] text-amber-500/80 font-black uppercase tracking-wider block">SACRED TIMELINE</span>
+                  <p className="text-xs font-serif font-bold text-white">Oct 10 - Oct 18, 2026</p>
+                  <span className="text-[9px] text-[#A69584] block font-semibold">9 Divine Concert Nights</span>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-white/[0.04] border border-white/5 space-y-1">
+                  <span className="text-[10px] text-[#139D9E] font-black uppercase tracking-wider block">CELEBRATION ARENA</span>
+                  <p className="text-xs font-serif font-bold text-white">VIP Borivali Arena</p>
+                  <span className="text-[9px] text-[#A69584] block font-semibold">Mumbai, Maharashtra</span>
+                </div>
+              </div>
+
+              {/* Informative Guidance */}
+              <p className="text-[11px] text-[#A69584] leading-relaxed font-semibold max-w-sm">
+                Reserve entry tickets in advance, verify digital passes via secure verification, and checkout on the live dashboard.
+              </p>
+
+              {/* Mega CTA Button with Sweep and Glow */}
+              <button
+                onClick={handleEnterCelebration}
+                className="w-full relative group overflow-hidden py-4 px-8 bg-gradient-to-r from-[#D12E6B] via-amber-500 to-[#F59E0B] text-white rounded-2xl font-serif font-black text-xs md:text-sm uppercase tracking-widest transition-all hover:scale-[1.03] shadow-[0_4px_30px_rgba(209,46,107,0.35)] hover:shadow-[0_4px_40px_rgba(245,158,11,0.5)] active:scale-98 cursor-pointer flex items-center justify-center gap-2"
+              >
+                <Ticket className="w-4 h-4 fill-white/20 animate-pulse" />
+                ENTER FESTIVAL PORTAL
+                <ChevronRight className="w-4 h-4 translate-x-0 group-hover:translate-x-1 transition-transform" />
+              </button>
+            </motion.div>
+
+            {/* Ambient Footer */}
+            <div className="absolute bottom-6 text-[#8C7D72] text-[9.5px] uppercase font-bold tracking-[0.25em] z-20 flex items-center gap-1.5 opacity-65">
+              <span>● IMMERSIVE AUDIO-VISUAL THEATER ACTIVE</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Background layer elements containing marigold garlands, diyas and lanterns */}
       <NavratriBackground />
 
@@ -280,12 +644,15 @@ export default function App() {
                   alt={user.displayName || "Avatar"} 
                   className="w-5 h-5 rounded-full border border-white" 
                 />
-                <span className="max-w-[90px] truncate font-bold hidden sm:inline">{user.displayName || user.email.split("@")[0]}</span>
+                <div className="flex flex-col text-left">
+                  <span className="max-w-[100px] truncate font-bold hidden sm:inline leading-none mb-0.5">{user.displayName || user.email.split("@")[0]}</span>
+                  <span className="text-[9px] text-[#D12E6B] font-extrabold uppercase tracking-wider leading-none">
+                    {user.email === "satrang2026@gmail.com" ? "Organizer Admin" : "User Portal"}
+                  </span>
+                </div>
                 <span className="text-[#E9E1D5] font-light">|</span>
                 <button
-                  onClick={async () => {
-                    await api.logout();
-                  }}
+                  onClick={handleLogout}
                   className="text-[10.5px] text-[#D12E6B] hover:opacity-80 font-bold transition-opacity cursor-pointer uppercase tracking-wider"
                 >
                   Logout
@@ -293,16 +660,10 @@ export default function App() {
               </div>
             ) : (
               <button
-                onClick={async () => {
-                  try {
-                    await api.loginWithGoogle();
-                  } catch (err) {
-                    alert("Authentication aborted or cancelled by visitor.");
-                  }
-                }}
+                onClick={() => setShowAuthModal(true)}
                 className="flex items-center gap-1.5 px-4 py-2 bg-gradient-to-r from-[#D12E6B] to-[#F59E0B] text-white rounded-xl text-xs font-bold transition-all hover:shadow-md cursor-pointer shadow-sm active:scale-95"
               >
-                <Key className="w-3.5 h-3.5 text-white" /> Access Login
+                <Key className="w-3.5 h-3.5 text-white" /> Login/Signup
               </button>
             )}
           </div>
@@ -320,41 +681,63 @@ export default function App() {
       {/* Main Container Content Area */}
       <main className="max-w-7xl mx-auto px-6 py-6 relative z-10 space-y-12">
 
-        {/* Traditional Elegant Hero Section precisely designed after the attached image card */}
+        {/* Traditional Elegant Hero Section with Live Background Video Loop */}
         {activeTab === "reserve" && (
-          <div className="relative rounded-3xl bg-white border border-[#E9E1D5] p-6 md:p-12 overflow-hidden flex flex-col lg:flex-row items-center justify-between gap-8 shadow-sm">
+          <div className="relative rounded-3xl bg-[#130E26] border border-amber-500/20 p-6 md:p-12 overflow-hidden flex flex-col lg:flex-row items-center justify-between gap-8 shadow-xl">
+            
+            {/* Absolute Background Video Player */}
+            <div className="absolute inset-0 w-full h-full overflow-hidden pointer-events-none select-none z-0">
+              <video
+                ref={mainVideoRef}
+                key={videoUrl}
+                className="w-full h-full object-cover opacity-70"
+                style={{
+                  width: `${videoZoom * 100}%`,
+                  height: `${videoZoom * 100}%`,
+                  transform: `translateY(${videoOffset}px)`
+                }}
+                autoPlay
+                loop
+                muted
+                playsInline
+                referrerPolicy="no-referrer"
+                crossOrigin="anonymous"
+              >
+                <source src={videoUrl} type="video/mp4" referrerPolicy="no-referrer" />
+                <source src="https://assets.mixkit.co/videos/preview/mixkit-bright-gold-particles-in-motion-background-40748-large.mp4" type="video/mp4" referrerPolicy="no-referrer" />
+                <source src="https://cdn.pixabay.com/video/2020/09/16/50548-462194917_large.mp4" type="video/mp4" referrerPolicy="no-referrer" />
+              </video>
+              {/* Semi-transparent dark overlay to ensure maximum text contrast */}
+              <div className="absolute inset-0 bg-gradient-to-r from-black/90 via-black/70 to-black/30 md:from-black/85 md:via-[#130E26]/80 md:to-transparent" />
+            </div>
+
             {/* Soft decorative background circles */}
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[34rem] h-[34rem] border border-dashed border-[#E9E1D5] rounded-full pointer-events-none opacity-40 animate-[spin_100s_linear_infinite]" />
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[34rem] h-[34rem] border border-dashed border-amber-500/10 rounded-full pointer-events-none opacity-40 animate-[spin_100s_linear_infinite] z-0" />
             
             {/* Title & details block */}
             <div className="space-y-5 max-w-xl text-center lg:text-left z-10">
-              <span className="bg-[#D12E6B]/10 text-[#D12E6B] px-3.5 py-1.5 text-xs rounded-full border border-[#D12E6B]/25 font-bold tracking-widest uppercase inline-block font-mono">
+              <span className="bg-amber-500/15 text-amber-300 px-3.5 py-1.5 text-xs rounded-full border border-amber-500/30 font-bold tracking-widest uppercase inline-block font-mono">
                 💫 SHREE DURGAYAI NAMAH 💫
               </span>
-              <h2 className="text-3xl md:text-5xl font-serif font-black tracking-tight text-[#2C1D13] leading-tight">
+              <h2 className="text-3xl md:text-5xl font-serif font-black tracking-tight text-white leading-tight">
                 Traditional Garba <br />& Dandiya Raas 2026
               </h2>
-              <div className="h-0.5 w-24 bg-gradient-to-r from-[#D12E6B] to-[#F59E0B] rounded-full mx-auto lg:mx-0" />
-              <p className="text-sm md:text-base text-[#6B5D52] leading-relaxed font-medium">
+              <div className="h-0.5 w-24 bg-gradient-to-r from-[#D12E6B] to-amber-500 rounded-full mx-auto lg:mx-0" />
+              <p className="text-sm md:text-base text-amber-100/90 leading-relaxed font-medium">
                 Welcome to Gujarat and Maharashtra's premier celebration portals! Book authenticated entrance permits for the grand nine nights of Navratri with real-time slot management, secure Razorpay verification, and instant door-QR voucher deliveries.
               </p>
-              <div className="flex flex-wrap justify-center lg:justify-start gap-4 text-xs font-bold text-[#8C7D72] pt-2">
-                <span className="flex items-center gap-1.5 bg-[#FAF6F0] px-3.5 py-1.5 rounded-full border border-[#E9E1D5]"><Calendar className="w-4 h-4 text-[#D12E6B]" /> Oct 10 - Oct 18, 2026</span>
-                <span className="flex items-center gap-1.5 bg-[#FAF6F0] px-3.5 py-1.5 rounded-full border border-[#E9E1D5]"><MapPin className="w-4 h-4 text-[#139D9E]" /> VIP Mumbai Arena</span>
+              <div className="flex flex-wrap justify-center lg:justify-start gap-4 text-xs font-bold text-amber-200/90 pt-2">
+                <span className="flex items-center gap-1.5 bg-white/10 backdrop-blur-md px-3.5 py-1.5 rounded-full border border-white/10 shadow-sm">
+                  <Calendar className="w-4 h-4 text-amber-400" /> Oct 10 - Oct 18, 2026
+                </span>
+                <span className="flex items-center gap-1.5 bg-white/10 backdrop-blur-md px-3.5 py-1.5 rounded-full border border-white/10 shadow-sm">
+                  <MapPin className="w-4 h-4 text-emerald-400" /> VIP Mumbai Arena
+                </span>
               </div>
             </div>
 
-            {/* Illustrated Garba dancers block - loaded directly from generated graphics */}
-            <div className="relative shrink-0 w-80 h-80 sm:w-96 sm:h-96 flex items-center justify-center z-10">
-              {/* Outer mandala backing ring */}
-              <div className="absolute inset-0 bg-gradient-to-tr from-amber-50 to-rose-50 rounded-full blur-2xl opacity-50" />
-              <img
-                src={garbaCoupleImg}
-                alt="Traditional Garba Couple playing Dandiya illustration"
-                className="relative w-auto h-full max-h-[340px] md:max-h-[380px] object-contain drop-shadow-lg transform transition-transform hover:scale-102"
-                referrerPolicy="no-referrer"
-              />
-            </div>
+            {/* Right side spacer to allow the background video dancers to be fully visible */}
+            <div className="hidden lg:block lg:w-96 lg:h-80 z-10 pointer-events-none" />
           </div>
         )}
 
@@ -375,6 +758,7 @@ export default function App() {
               
               {/* Left Column: 9 Garba Days Cards Grid */}
               <div className="lg:col-span-2 space-y-5">
+                
                 <div className="select-none space-y-1">
                   <h3 className="font-serif font-bold text-lg md:text-xl text-[#2C1D13] flex items-center gap-2">
                     Select a Sacred Night
@@ -715,19 +1099,13 @@ export default function App() {
                     </p>
                   </div>
                   <button
-                    onClick={async () => {
-                      try {
-                        await api.loginWithGoogle();
-                      } catch (err) {
-                        alert("Authentication aborted or cancelled.");
-                      }
-                    }}
+                    onClick={() => setShowAuthModal(true)}
                     className="w-full py-3 bg-gradient-to-r from-[#D12E6B] to-[#F59E0B] text-white rounded-xl font-bold text-xs uppercase tracking-wider hover:opacity-95 transition-opacity cursor-pointer shadow-sm"
                   >
-                    Login with Google
+                    Open Login Portal
                   </button>
                 </div>
-              ) : user.email !== "manavgameium@gmail.com" ? (
+              ) : user.email !== "satrang2026@gmail.com" ? (
                 <div className="max-w-md mx-auto bg-white border border-[#E9E1D5] p-8 rounded-2xl text-center space-y-5 shadow-sm">
                   <ShieldAlert className="w-12 h-12 text-[#D12E6B] mx-auto" />
                   <div className="space-y-1.5">
@@ -744,9 +1122,7 @@ export default function App() {
                       Return to Festival
                     </button>
                     <button
-                      onClick={async () => {
-                        await api.logout();
-                      }}
+                      onClick={handleLogout}
                       className="flex-1 py-2.5 bg-[#D12E6B] text-white rounded-xl text-xs font-bold hover:opacity-90 cursor-pointer transition-opacity"
                     >
                       Sign Out
@@ -756,7 +1132,7 @@ export default function App() {
               ) : (
                 <AdminDashboard
                   days={days}
-                  bookings={bookings}
+                  bookings={adminBookings}
                   auditLogs={auditLogs}
                   onRefreshAll={handleFullRefresh}
                 />
@@ -794,6 +1170,210 @@ export default function App() {
               <p className="text-[#6B5D52] font-semibold leading-normal">{activeAnnouncement.body}</p>
             </div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Traditional Authenticator/Reg portal */}
+      <AnimatePresence>
+        {showAuthModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 15 }}
+              className="bg-white rounded-3xl border-2 border-[#D12E6B]/20 w-full max-w-md overflow-hidden relative shadow-2xl flex flex-col text-[#3C2D24]"
+              id="auth-modal-window"
+            >
+              {/* Traditional Marigold Garland/Diyas Banner decoration */}
+              <div className="relative bg-gradient-to-r from-[#D12E6B] to-[#F59E0B] p-6 text-white text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAuthModal(false);
+                    setAuthError(null);
+                    setAuthSuccessMsg(null);
+                  }}
+                  className="absolute top-4 right-4 p-1 rounded-full bg-white/20 hover:bg-white/35 transition-colors cursor-pointer text-white"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <span className="text-[10px] font-mono font-black tracking-[0.2em] uppercase">Festive Gate Security</span>
+                <h3 className="font-serif font-black text-xl mt-1">Dandiya Access Portal</h3>
+                <p className="text-[11px] text-white/80 font-medium">Register for pass checkout or log in to access your dashboard</p>
+              </div>
+
+              {/* Secure Tab Toggles */}
+              <div className="grid grid-cols-2 border-b border-[#E9E1D5] text-xs font-serif font-bold">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthTab("signin");
+                    setAuthError(null);
+                    setAuthSuccessMsg(null);
+                  }}
+                  className={`py-3.5 text-center transition-colors cursor-pointer border-r border-[#E9E1D5] ${
+                    authTab === "signin"
+                      ? "bg-[#FAF6F0] text-[#D12E6B] border-b-2 border-b-[#D12E6B]"
+                      : "text-[#8C7D72] hover:bg-gray-50"
+                  }`}
+                >
+                  Sign In (Login)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthTab("signup");
+                    setAuthError(null);
+                    setAuthSuccessMsg(null);
+                  }}
+                  className={`py-3.5 text-center transition-colors cursor-pointer ${
+                    authTab === "signup"
+                      ? "bg-[#FAF6F0] text-[#D12E6B] border-b-2 border-b-[#D12E6B]"
+                      : "text-[#8C7D72] hover:bg-gray-50"
+                  }`}
+                >
+                  Create Account (Register)
+                </button>
+              </div>
+
+              {/* Modal Core Body Content */}
+              <div className="p-6 space-y-4">
+                
+                {/* Reactive Notifications Alerts */}
+                {authError && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl font-medium"
+                  >
+                    ⚠️ {authError}
+                  </motion.div>
+                )}
+
+                {authSuccessMsg && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl font-medium"
+                  >
+                    ✅ {authSuccessMsg}
+                  </motion.div>
+                )}
+
+                {authTab === "signin" ? (
+                  /* --- SIGN IN FORM --- */
+                  <form onSubmit={handleCustomLogin} className="space-y-4">
+                    <p className="text-[11px] text-[#8C7D72] font-semibold italic">
+                      Admin organizers must sign in here using their master staff profile. Attendees can log in to view bought ticket histories.
+                    </p>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-bold text-[#6B5D52] uppercase tracking-wider">Email Address</label>
+                      <input
+                        type="email"
+                        placeholder="attendee@example.com"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        className="w-full text-xs p-3 rounded-xl border border-[#E9E1D5] bg-[#FAF6F0]/20 focus:bg-white focus:outline-none focus:border-[#D12E6B] transition-colors font-medium"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-bold text-[#6B5D52] uppercase tracking-wider block">Password</label>
+                      <input
+                        type="password"
+                        placeholder="••••••••"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        className="w-full text-xs p-3 rounded-xl border border-[#E9E1D5] bg-[#FAF6F0]/20 focus:bg-white focus:outline-none focus:border-[#D12E6B] transition-colors font-mono"
+                        required
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="w-full py-3 bg-gradient-to-r from-[#D12E6B] to-[#F59E0B] text-white rounded-xl font-bold font-serif text-xs uppercase tracking-wider hover:opacity-95 transition-opacity cursor-pointer shadow-md active:scale-98"
+                    >
+                      Verify & Log In
+                    </button>
+                  </form>
+                ) : (
+                  /* --- SIGN UP (REGISTRATION) FORM --- */
+                  <form onSubmit={handleCustomRegister} className="space-y-4">
+                    <p className="text-[11px] text-[#8C7D72] font-semibold italic">
+                      Register your profile onto the safe decentralized attendee node. Only a valid email can register.
+                    </p>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-bold text-[#6B5D52] uppercase tracking-wider">Full Guest Name</label>
+                      <input
+                        type="text"
+                        placeholder="Karan Sharma"
+                        value={authName}
+                        onChange={(e) => setAuthName(e.target.value)}
+                        className="w-full text-xs p-3 rounded-xl border border-[#E9E1D5] bg-[#FAF6F0]/20 focus:bg-white focus:outline-none focus:border-[#D12E6B] transition-colors font-medium"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-bold text-[#6B5D52] uppercase tracking-wider">Email Address</label>
+                      <input
+                        type="email"
+                        placeholder="karan@gmail.com"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        className="w-full text-xs p-3 rounded-xl border border-[#E9E1D5] bg-[#FAF6F0]/20 focus:bg-white focus:outline-none focus:border-[#D12E6B] transition-colors font-medium"
+                        required
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] font-bold text-[#6B5D52] uppercase tracking-wider block">Choose Password</label>
+                      <input
+                        type="password"
+                        placeholder="••••••••"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        className="w-full text-xs p-3 rounded-xl border border-[#E9E1D5] bg-[#FAF6F0]/20 focus:bg-white focus:outline-none focus:border-[#D12E6B] transition-colors font-mono"
+                        required
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="w-full py-3 bg-gradient-to-r from-[#139D9E] to-[#D12E6B] text-white rounded-xl font-bold font-serif text-xs uppercase tracking-wider hover:opacity-95 transition-opacity cursor-pointer shadow-md active:scale-98"
+                    >
+                      Complete Registration
+                    </button>
+                  </form>
+                )}
+
+                {/* Secure Google OAuth Backup Separator */}
+                <div className="relative flex py-2 items-center">
+                  <div className="flex-grow border-t border-[#E9E1D5]"></div>
+                  <span className="flex-shrink mx-4 text-[9px] text-[#A69584] uppercase font-bold tracking-wider">or sign in securely with</span>
+                  <div className="flex-grow border-t border-[#E9E1D5]"></div>
+                </div>
+
+                {/* Google OAuth Login Call */}
+                <button
+                  type="button"
+                  onClick={() => handleLoginRole("user", "google")}
+                  className="w-full py-2.5 bg-white border border-[#E9E1D5] hover:border-amber-500 rounded-xl text-xs font-bold font-serif shadow-sm transition-all text-[#3C2D24] hover:shadow flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+                >
+                  <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/action/google.svg" alt="Google logo" className="w-4 h-4" />
+                  Sign In with Google Identity
+                </button>
+              </div>
+
+              {/* Informative Hint Footer */}
+              <div className="bg-[#FAF6F0] p-4 text-center border-t border-[#E9E1D5] text-[10px] text-[#8C7D72]">
+                🔒 High availability MongoDB & Firestore synchronized core.
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 

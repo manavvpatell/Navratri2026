@@ -8,27 +8,18 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
-import { initializeApp, getApps } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
 
 import { Booking, AuditLog, UserNotification, NavratriDay } from "./src/types";
 import { INITIAL_NAVRATRI_DAYS } from "./src/lib/data";
+import { getMongoDb, seedMongoDatabase, isMongoDbOffline, setMongoDbOffline } from "./mongo-db";
 
 dotenv.config();
-
-// Initialize Firebase Admin with scale-safe, multi-instance configuration
-if (!getApps().length) {
-  initializeApp({
-    projectId: "gen-lang-client-0839675368"
-  });
-}
-// Establish direct node connector to your specific project isolation DB
-const db = getFirestore("ai-studio-9a9ddb27-1797-4d8c-87ab-c375da07207e");
 
 // In-Memory fallback buffers (to support absolute zero-downtime offline capabilities)
 let daysData: NavratriDay[] = [...INITIAL_NAVRATRI_DAYS];
 let bookings: Booking[] = [];
 let auditLogs: AuditLog[] = [];
+let usersRegisterCache: any[] = [];
 let notifications: UserNotification[] = [
   {
     id: "announce-1",
@@ -67,7 +58,7 @@ function generateTicketHash(orderId: string, dayNum: number, email: string): str
   return hash.substring(0, 48);
 }
 
-// Global logger helper
+// Global logger helper connecting to MongoDB
 async function addAuditLog(level: "info" | "warning" | "error" | "security", event: string, details: string, email: string = "system") {
   const log: AuditLog = {
     id: "LOG-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
@@ -78,10 +69,14 @@ async function addAuditLog(level: "info" | "warning" | "error" | "security", eve
     email
   };
 
-  try {
-    await db.collection("audit_logs").doc(log.id).set(log);
-  } catch (err) {
-    console.warn("[OFFLINE fallback] Logging locally because Firestore transaction hit an issue: ", err);
+  if (!isMongoDbOffline()) {
+    try {
+      const mdb = await getMongoDb();
+      await mdb.collection("audit_logs").insertOne(log);
+    } catch (err) {
+      auditLogs.unshift(log);
+    }
+  } else {
     auditLogs.unshift(log);
   }
 
@@ -104,25 +99,192 @@ async function startServer() {
     next();
   });
 
-  // Database Bootstrap (Seeds default festival slots on cold-boots)
-  const seedCapacityState = async () => {
+  // Connect to MongoDB and seed capacity_state collection with default nights
+  await seedMongoDatabase();
+
+  // Load existing bookings and logs from MongoDB to pre-populate caches
+  const preloadCollections = async () => {
     try {
-      const capacityColl = db.collection("capacity_state");
-      const snapshot = await capacityColl.limit(1).get();
-      if (snapshot.empty) {
-        console.log("[SEED] Firestore capacity_state collection empty. Seeding INITIAL_NAVRATRI_DAYS...");
-        for (const day of INITIAL_NAVRATRI_DAYS) {
-          await capacityColl.doc(String(day.day)).set(day);
-        }
-        console.log("[SEED] Firestore capacity-state seeding completed.");
+      const mdb = await getMongoDb();
+      const loadedBookings = await mdb.collection("bookings").find({}).toArray();
+      bookings = loadedBookings as any;
+      console.log(`[BOOTSTRAP-MONGO] Preloaded ${bookings.length} bookings from MongoDB.`);
+
+      const loadedLogs = await mdb.collection("audit_logs").find({}).sort({ timestamp: -1 }).limit(100).toArray();
+      auditLogs = loadedLogs as any;
+      console.log(`[BOOTSTRAP-MONGO] Preloaded ${auditLogs.length} audit logs from MongoDB.`);
+
+      const loadedNotifs = await mdb.collection("notifications").find({}).toArray();
+      if (loadedNotifs.length > 0) {
+        notifications = loadedNotifs as any;
       }
+
+      const loadedUsers = await mdb.collection("users").find({}).toArray();
+      usersRegisterCache = loadedUsers as any;
+      console.log(`[BOOTSTRAP-MONGO] Preloaded ${usersRegisterCache.length} users from MongoDB.`);
     } catch (err) {
-      console.warn("Firestore Database loading notice (Running seed fallback) :", err);
+      console.warn("[BOOTSTRAP-MONGO] Direct preloading skipped or offline fallback active: ", err);
     }
   };
-  await seedCapacityState();
+  await preloadCollections();
 
   // --- API ROUTING SECTION ---
+
+  app.post("/api/auth/register", async (req, res) => {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ success: false, message: "Full Name, Email and Password are all required." });
+    }
+
+    const trimmedEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      return res.status(400).json({ success: false, message: "Please enter a valid email address format (e.g., user@example.com)." });
+    }
+
+    if (trimmedEmail === "satrang2026@gmail.com") {
+      return res.status(400).json({ success: false, message: "This email address is reserved for the Organizer Admin." });
+    }
+
+    try {
+      let isOffline = isMongoDbOffline();
+      let exists = false;
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          const existingUser = await mdb.collection("users").findOne({ email: trimmedEmail });
+          if (existingUser) exists = true;
+        } catch (err) {
+          console.warn("DB offline during registration check, relying on local cache", err);
+          isOffline = true;
+        }
+      }
+
+      if (!exists) {
+        exists = usersRegisterCache.some((u) => u.email === trimmedEmail);
+      }
+
+      if (exists) {
+        return res.status(400).json({ success: false, message: "An account with this email address already exists." });
+      }
+
+      const newUser = {
+        id: "USER-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
+        name: name.trim(),
+        email: trimmedEmail,
+        password,
+        createdAt: new Date().toISOString()
+      };
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          await mdb.collection("users").insertOne(newUser);
+        } catch (err) {
+          console.warn("DB offline during registration save, saving in memory cache only", err);
+        }
+      }
+
+      usersRegisterCache.push(newUser);
+      await addAuditLog("info", "USER_REGISTERED", `New user successfully registered: ${name} (${trimmedEmail})`, trimmedEmail);
+
+      res.json({
+        success: true,
+        message: "Registration completed successfully!",
+        user: {
+          uid: newUser.id,
+          email: newUser.email,
+          displayName: newUser.name,
+          role: "user",
+          photoURL: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(newUser.name)}`
+        }
+      });
+    } catch (err: any) {
+      console.error("Registration error: ", err);
+      res.status(500).json({ success: false, message: "An unexpected error occurred during registration. Please try again." });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: "Email and password are both required." });
+    }
+
+    const trimmedEmail = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(trimmedEmail)) {
+      return res.status(400).json({ success: false, message: "Please enter a valid email address format (e.g., user@example.com)." });
+    }
+
+    // Check Admin Credentials first
+    if (trimmedEmail === "satrang2026@gmail.com") {
+      if (password === "Satrang@2026") {
+        await addAuditLog("security", "AUTH_ADMIN_SUCCESS", "Admin logged in successfully", "satrang2026@gmail.com");
+        return res.json({
+          success: true,
+          message: "Admin validation successful. Welcome back, Organizer!",
+          user: {
+            uid: "mock-admin-id",
+            email: "satrang2026@gmail.com",
+            displayName: "Satrang Admin",
+            role: "admin",
+            photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=Satrang"
+          }
+        });
+      } else {
+        await addAuditLog("security", "AUTH_ADMIN_FAILED", "Failed Admin password login attempt", "satrang2026@gmail.com");
+        return res.status(401).json({ success: false, message: "Incorrect password for Organizer Admin." });
+      }
+    }
+
+    // Normal User Login
+    try {
+      let isOffline = isMongoDbOffline();
+      let matchUser: any = null;
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          matchUser = await mdb.collection("users").findOne({ email: trimmedEmail });
+        } catch (err) {
+          console.warn("DB offline during login check, relying on local cache", err);
+          isOffline = true;
+        }
+      }
+
+      if (!matchUser) {
+        matchUser = usersRegisterCache.find((u) => u.email === trimmedEmail);
+      }
+
+      if (!matchUser) {
+        return res.status(401).json({ success: false, message: "No user account found with this email. Please register first." });
+      }
+
+      if (matchUser.password !== password) {
+        await addAuditLog("security", "AUTH_USER_FAILED", `Incorrect password attempt for ${trimmedEmail}`, trimmedEmail);
+        return res.status(401).json({ success: false, message: "Incorrect password. Please try again." });
+      }
+
+      await addAuditLog("info", "AUTH_USER_SUCCESS", `Logged in successfully: ${matchUser.name}`, trimmedEmail);
+
+      res.json({
+        success: true,
+        message: `Welcome back, ${matchUser.name}!`,
+        user: {
+          uid: matchUser._id || matchUser.id,
+          email: matchUser.email,
+          displayName: matchUser.name,
+          role: "user",
+          photoURL: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(matchUser.name)}`
+        }
+      });
+    } catch (err: any) {
+      console.error("Login error: ", err);
+      res.status(500).json({ success: false, message: "An unexpected error occurred during login." });
+    }
+  });
 
   // Service health status
   app.get("/api/health", (req, res) => {
@@ -157,19 +319,19 @@ async function startServer() {
 
   // Retrieve current days parameters and capacities
   app.get("/api/days", async (req, res) => {
+    if (isMongoDbOffline()) {
+      return res.json(daysData);
+    }
     try {
-      const snapshot = await db.collection("capacity_state").get();
-      const list: any[] = [];
-      snapshot.forEach((doc) => {
-        list.push(doc.data());
-      });
+      const mdb = await getMongoDb();
+      const list = await mdb.collection("capacity_state").find({}).toArray();
       if (list.length > 0) {
         list.sort((a, b) => a.day - b.day);
-        daysData = list; // Update in-memory cache
+        daysData = list as any; // Update in-memory cache
         return res.json(list);
       }
     } catch (err) {
-      console.warn("Firestore: reading capacities failed, delivering cache.", err);
+      // Suppress connection warning outputs to prevent telemetry log pollution
     }
     res.json(daysData);
   });
@@ -191,12 +353,28 @@ async function startServer() {
     const dayNum = parseInt(day);
 
     try {
-      const dayDoc = await db.collection("capacity_state").doc(String(dayNum)).get();
-      if (!dayDoc.exists) {
+      let selectedDay: NavratriDay | undefined;
+      let isOffline = isMongoDbOffline();
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          selectedDay = await mdb.collection("capacity_state").findOne({ day: dayNum }) as any;
+        } catch (dbErr) {
+          console.warn("DB offline during create-order, resorting to memory fallback", dbErr);
+          isOffline = true;
+        }
+      }
+
+      if (isOffline || !selectedDay) {
+        // Fallback to in-memory days list (daysData)
+        selectedDay = daysData.find(d => d.day === dayNum);
+      }
+
+      if (!selectedDay) {
         return res.status(404).json({ success: false, message: `Descriptive Navratri Day [${dayNum}] does not exist.` });
       }
 
-      const selectedDay = dayDoc.data() as NavratriDay;
       const availableSlots = selectedDay.maxCapacity - selectedDay.currentCapacity;
       if (availableSlots <= 0) {
         await addAuditLog("warning", "CAPACITY_EXCEEDED_ATTEMPT", `Attempted order booking for sold-out Day ${dayNum} (${selectedDay.devi})`, email);
@@ -220,13 +398,21 @@ async function startServer() {
         createdAt: new Date().toISOString()
       };
 
-      // Set booking in Firestore
-      await db.collection("bookings").doc(id).set(newBooking);
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          await mdb.collection("bookings").insertOne(newBooking);
+        } catch (dbErr) {
+          console.warn("Failed to write pending booking to DB, saving in-memory only", dbErr);
+        }
+      }
+
+      bookings.push(newBooking); // Sync backup in-memory registry always!
 
       await addAuditLog(
         "info",
         "PAYMENT_ORDER_CREATED",
-        `Initiated pass checkout for ${name} (Day ${dayNum} - ${selectedDay.devi}) - Order ID: ${orderId}`,
+        `Initiated pass checkout for ${name} (Day ${dayNum} - ${selectedDay.devi}) - Order ID: ${orderId} [${isOffline ? "MEMORY_FALLBACK" : "MONGO_ACTIVE"}]`,
         email
       );
 
@@ -235,7 +421,8 @@ async function startServer() {
         orderId,
         amount,
         currency: "INR",
-        dayDetails: selectedDay
+        dayDetails: selectedDay,
+        isMongoOffline: isOffline
       });
 
     } catch (err: any) {
@@ -249,108 +436,170 @@ async function startServer() {
     const { orderId, paymentId, signature, status } = req.body;
 
     try {
-      const bookingsColl = db.collection("bookings");
-      const bookingQuery = await bookingsColl.where("orderId", "==", orderId).limit(1).get();
+      let booking = bookings.find(b => b.orderId === orderId);
+      let isOffline = isMongoDbOffline();
 
-      if (bookingQuery.empty) {
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          const dbBooking = await mdb.collection("bookings").findOne({ orderId: orderId }) as any;
+          if (dbBooking) {
+            booking = dbBooking;
+          }
+        } catch (dbErr) {
+          console.warn("DB offline during verification find, using cache", dbErr);
+          isOffline = true;
+        }
+      }
+
+      if (!booking) {
         await addAuditLog("error", "PAYMENT_VERIFICATION_ORPHANED", `Received transaction signature for unknown order reference: ${orderId}`, "unknown");
         return res.status(404).json({ success: false, message: "Booking order reference not found in registries." });
       }
-
-      const bookingDoc = bookingQuery.docs[0];
-      const booking = bookingDoc.data() as Booking;
 
       if (booking.status !== "pending") {
         return res.status(400).json({ success: false, message: "Transaction already processed and finalized." });
       }
 
       if (status === "failed") {
-        await bookingDoc.ref.update({ status: "failed" });
+        booking.status = "failed";
+        if (!isOffline) {
+          try {
+            const mdb = await getMongoDb();
+            await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: { status: "failed" } });
+          } catch (dbErr) {
+            console.warn("Could not sync failed status to Mongo, cache updated", dbErr);
+          }
+        }
         await addAuditLog("warning", "PAYMENT_FAILED", `Garba pass checkout failed or aborted at gateway for order ID: ${orderId}`, booking.email);
         return res.json({ success: false, message: "Payment checkout was canceled or failed authorization." });
       }
 
-      // Execute high-speed atomic capacity locks using horizontal transaction boundaries
-      const capacityDocRef = db.collection("capacity_state").doc(String(booking.day));
-      let capacityExceeded = false;
-      let updatedBooking: Booking | null = null;
+      // Execute high-speed atomic capacity locks dynamically
       let targetDay: NavratriDay | null = null;
 
-      await db.runTransaction(async (transaction) => {
-        const capSnap = await transaction.get(capacityDocRef);
-        const dayData = capSnap.data() as NavratriDay;
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          const capacityUpdate = await mdb.collection("capacity_state").findOneAndUpdate(
+            { 
+              day: booking.day,
+              $expr: { $lt: ["$currentCapacity", "$maxCapacity"] } 
+            },
+            { 
+              $inc: { currentCapacity: 1 } 
+            },
+            { 
+              returnDocument: "after" 
+            }
+          );
 
-        if (!dayData) {
-          throw new Error("Relational day metadata lost.");
+          if (capacityUpdate && "value" in capacityUpdate && capacityUpdate.value) {
+            targetDay = capacityUpdate.value as any;
+          } else if (capacityUpdate && !("value" in capacityUpdate)) {
+            targetDay = capacityUpdate as any;
+          }
+        } catch (dbErr) {
+          console.warn("Could not execute Mongo atomic capacity update, falling back to memory", dbErr);
+          isOffline = true;
         }
+      }
 
-        const availableSlots = dayData.maxCapacity - dayData.currentCapacity;
-        if (availableSlots <= 0) {
-          capacityExceeded = true;
-          return;
+      // Fallback to local memory capacity if MongoDB fails
+      if (isOffline || !targetDay) {
+        const memDayObj = daysData.find(d => d.day === booking!.day);
+        if (memDayObj && memDayObj.currentCapacity < memDayObj.maxCapacity) {
+          memDayObj.currentCapacity += 1;
+          targetDay = memDayObj;
         }
+      }
 
-        // Atomically lock unit slot
-        const newSold = dayData.currentCapacity + 1;
-        transaction.update(capacityDocRef, { currentCapacity: newSold });
-
-        dayData.currentCapacity = newSold;
-        targetDay = dayData;
-
-        // Produce authentic ticket hash and seal booking
-        const ticketHash = generateTicketHash(orderId, booking.day, booking.email);
-        updatedBooking = {
-          ...booking,
-          status: "success",
-          paymentId: paymentId || "pay_" + Math.random().toString(36).substring(2, 10).toUpperCase(),
-          paymentSignature: signature || "sig_" + Math.random().toString(36).substring(2, 14).toUpperCase(),
-          ticketHash,
-          isScanned: false
-        };
-
-        transaction.set(bookingDoc.ref, updatedBooking);
-      });
-
-      if (capacityExceeded) {
-        await bookingDoc.ref.update({ status: "failed" });
+      if (!targetDay) {
+        booking.status = "failed";
+        if (!isOffline) {
+          try {
+            const mdb = await getMongoDb();
+            await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: { status: "failed" } });
+          } catch (dbErr) {
+            console.warn("Failed to mark booking failed in MongoDB", dbErr);
+          }
+        }
         await addAuditLog("security", "RACE_CONDITION_BLOCKED", `Blocked ticket issuance during signature verification - Day ${booking.day} sold out mid-payment`, booking.email);
         return res.status(400).json({ success: false, message: "We apologize! Capacity maximum limit reached during payment authorization. Refund initiated." });
       }
 
-      if (!updatedBooking || !targetDay) {
-        return res.status(500).json({ success: false, message: "Atomic transaction lock commit error." });
+      // Produce authentic ticket hash and seal booking
+      const ticketHash = generateTicketHash(orderId, booking.day, booking.email);
+      const updatedBooking: Booking = {
+        ...booking,
+        status: "success",
+        paymentId: paymentId || "pay_" + Math.random().toString(36).substring(2, 10).toUpperCase(),
+        paymentSignature: signature || "sig_" + Math.random().toString(36).substring(2, 14).toUpperCase(),
+        ticketHash,
+        isScanned: false
+      };
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: updatedBooking });
+        } catch (dbErr) {
+          console.warn("Could not sync confirmed booking to MongoDB", dbErr);
+        }
       }
 
-      // Broadast dynamic live capacities across observers
+      // Sync master bookings in-memory cache
+      const bIdx = bookings.findIndex(b => b.id === updatedBooking.id || b.orderId === updatedBooking.orderId);
+      if (bIdx !== -1) {
+        bookings[bIdx] = updatedBooking;
+      } else {
+        bookings.push(updatedBooking);
+      }
+
+      // Broadcast booking update dynamically to all listening devices
+      broadcastSSE("booking_update", updatedBooking);
+
+      // Broadcast dynamic live capacities across observers
       broadcastSSE("capacity_update", {
         day: booking.day,
-        currentCapacity: (targetDay as NavratriDay).currentCapacity
+        currentCapacity: targetDay.currentCapacity
       });
 
-      // Write user notice to Firestore
+      // Write user notice
       const newNotification: UserNotification = {
         id: "notif_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
         title: "🎫 Garba Pass Confirmed!",
-        body: `Congratulations ${booking.name}! Your Day ${booking.day} pass for ${(targetDay as NavratriDay).devi} night is confirmed. QR Ticket emailed to ${booking.email}`,
+        body: `Congratulations ${booking.name}! Your Day ${booking.day} pass for ${targetDay.devi} night is confirmed. QR Ticket mailed to ${booking.email}`,
         type: "success",
         timestamp: new Date().toISOString(),
         read: false
       };
-      await db.collection("notifications").doc(newNotification.id).set(newNotification);
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          await mdb.collection("notifications").insertOne(newNotification);
+        } catch (dbErr) {
+          console.warn("Failed to insert notification into DB, broadcasting only", dbErr);
+        }
+      } else {
+        notifications.unshift(newNotification);
+      }
       broadcastSSE("notification", newNotification);
 
       // Audit confirmed transaction
       await addAuditLog(
         "info",
         "BOOKING_CONFIRMED",
-        `Pass checkout cleared successfully. Generated Ticket QR: ${(updatedBooking as Booking).ticketHash} for Day ${booking.day}`,
+        `Pass checkout cleared successfully. Generated Ticket QR: ${updatedBooking.ticketHash} for Day ${booking.day}`,
         booking.email
       );
 
       res.json({
         success: true,
         booking: updatedBooking,
-        dayDetails: targetDay
+        dayDetails: targetDay,
+        isMongoOffline: isOffline
       });
 
     } catch (err: any) {
@@ -359,14 +608,33 @@ async function startServer() {
     }
   });
 
+  // Retrieve all database bookings
+  app.get("/api/bookings", async (req, res) => {
+    try {
+      const mdb = await getMongoDb();
+      const list = await mdb.collection("bookings").find({}).toArray();
+      res.json(list);
+    } catch (err) {
+      res.json(bookings);
+    }
+  });
+
+  // Client simulated/google logging endpoint
+  app.post("/api/logs/create", async (req, res) => {
+    const { action, details, email } = req.body;
+    try {
+      await addAuditLog("info", action || "CLIENT_LOG", details || "", email || "system");
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ success: false });
+    }
+  });
+
   // Retrieve security logs
   app.get("/api/logs", async (req, res) => {
     try {
-      const snap = await db.collection("audit_logs").orderBy("timestamp", "desc").limit(60).get();
-      const list: any[] = [];
-      snap.forEach((doc) => {
-        list.push(doc.data());
-      });
+      const mdb = await getMongoDb();
+      const list = await mdb.collection("audit_logs").find({}).sort({ timestamp: -1 }).limit(60).toArray();
       res.json(list);
     } catch (err) {
       res.json(auditLogs);
@@ -376,21 +644,13 @@ async function startServer() {
   // Calculate live statistics
   app.get("/api/stats", async (req, res) => {
     try {
-      const bookingsSnap = await db.collection("bookings").where("status", "==", "success").get();
-      const daysSnap = await db.collection("capacity_state").get();
-
-      const bookingsList: Booking[] = [];
-      bookingsSnap.forEach((doc) => {
-        bookingsList.push(doc.data() as Booking);
-      });
+      const mdb = await getMongoDb();
+      const bookingsList = await mdb.collection("bookings").find({ status: "success" }).toArray() as any[];
+      const daysList = await mdb.collection("capacity_state").find({}).toArray() as any[];
 
       const totalPayments = bookingsList.reduce((sum, b) => sum + b.amount, 0);
       const totalRegistrations = bookingsList.length;
 
-      const daysList: NavratriDay[] = [];
-      daysSnap.forEach((doc) => {
-        daysList.push(doc.data() as NavratriDay);
-      });
       daysList.sort((a, b) => a.day - b.day);
 
       const dailyStats = daysList.map((d) => ({
@@ -453,15 +713,26 @@ async function startServer() {
       read: false
     };
 
-    try {
-      await db.collection("notifications").doc(newNotification.id).set(newNotification);
-      broadcastSSE("notification", newNotification);
-      await addAuditLog("security", "ADMIN_BROADCAST", `Admin broadcasted venue announcement: "${title}"`, "admin@navratri2026.com");
-      res.json({ success: true, notification: newNotification });
-    } catch (err: any) {
-      console.error("Announcement write error: ", err);
-      res.status(500).json({ success: false, message: "Failed to broadcast announcement to cloud repository." });
+    let isOffline = isMongoDbOffline();
+
+    if (!isOffline) {
+      try {
+        const mdb = await getMongoDb();
+        await mdb.collection("notifications").insertOne(newNotification);
+      } catch (err: any) {
+        console.error("Announcement write error: ", err);
+        isOffline = true;
+      }
     }
+
+    // Always keep in sync with local memory list
+    if (isOffline || !notifications.some(n => n.id === newNotification.id)) {
+      notifications.unshift(newNotification);
+    }
+
+    broadcastSSE("notification", newNotification);
+    await addAuditLog("security", "ADMIN_BROADCAST", `Admin broadcasted venue announcement: "${title}"`, "admin@navratri2026.com");
+    res.json({ success: true, notification: newNotification, isMongoOffline: isOffline });
   });
 
   // Gate Scanner - Validates a unique ticket QR code hash
@@ -469,16 +740,31 @@ async function startServer() {
     const { qrHash } = req.body;
 
     try {
-      const bookingsRef = db.collection("bookings");
-      const querySnap = await bookingsRef.where("ticketHash", "==", qrHash).limit(1).get();
+      let match: Booking | undefined;
+      let isOffline = isMongoDbOffline();
 
-      if (querySnap.empty) {
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          const dbMatch = await mdb.collection("bookings").findOne({ ticketHash: qrHash }) as any;
+          if (dbMatch) {
+            match = dbMatch;
+          }
+        } catch (dbErr) {
+          console.warn("DB offline during QR code lookup", dbErr);
+          isOffline = true;
+        }
+      }
+
+      // Fallback: look up in local cache
+      if (!match) {
+        match = bookings.find(b => b.ticketHash === qrHash);
+      }
+
+      if (!match) {
         await addAuditLog("warning", "INVALID_QR_SCAN", `Gate check attempted with unrecognized QR Hash: ${qrHash}`, "gate_scanner");
         return res.status(404).json({ success: false, message: "Unauthorized ticket pass. Verification failed." });
       }
-
-      const bookingDoc = querySnap.docs[0];
-      const match = bookingDoc.data() as Booking;
 
       if (match.isScanned) {
         await addAuditLog("warning", "REDUNDANT_QR_SCAN", `Ticket ID ${match.id} QR scanned again. Counterfeit warning!`, "gate_scanner");
@@ -486,15 +772,30 @@ async function startServer() {
       }
 
       // Check-in
-      await bookingDoc.ref.update({ isScanned: true });
       match.isScanned = true;
+
+      if (!isOffline) {
+        try {
+          const mdb = await getMongoDb();
+          await mdb.collection("bookings").updateOne({ id: match.id }, { $set: { isScanned: true } });
+        } catch (dbErr) {
+          console.warn("Failed to sync scanned status to MongoDB", dbErr);
+        }
+      }
+
+      // Sync booking status in our cache
+      const bIdx = bookings.findIndex(b => b.id === match!.id);
+      if (bIdx !== -1) {
+        bookings[bIdx] = match;
+      }
 
       await addAuditLog("info", "GATE_TICKET_VALIDATED", `Ticket confirmation ID ${match.id} (Day ${match.day} - ${match.name}) successfully authorized for entrance.`, "gate_scanner");
 
       res.json({
         success: true,
         message: "Pass fully validated. Welcome to Navratri 2026!",
-        booking: match
+        booking: match,
+        isMongoOffline: isOffline
       });
 
     } catch (err) {

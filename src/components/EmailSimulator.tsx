@@ -24,14 +24,39 @@ export default function EmailSimulator({ bookings, activeEmail }: EmailSimulator
 
   // Sync state: filter bookings matching the signed-up customer, and update inbox list
   useEffect(() => {
-    const successful = bookings.filter((b) => b.status === "success");
+    if (!activeEmail || activeEmail.trim() === "") {
+      setInbox([]);
+      setSelectedMail(null);
+      return;
+    }
+
+    const normalizedEmail = activeEmail.trim().toLowerCase();
+    const successful = bookings.filter((b) => 
+      b.status === "success" && 
+      b.email && 
+      b.email.trim().toLowerCase() === normalizedEmail
+    );
+
+    // Sort to place the most recent confirmed ticket first
+    successful.sort((a, b) => {
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return timeB - timeA;
+    });
+
     setInbox(successful);
 
     if (successful.length > 0) {
-      setSelectedMail(successful[0]);
-      if (successful[0].email === activeEmail) {
-        setOpen(true);
-      }
+      // Find historical selection or default to the most recent one
+      setSelectedMail((prev) => {
+        if (prev && successful.some(item => item.id === prev.id)) {
+          return prev;
+        }
+        return successful[0];
+      });
+
+      // Auto-open mailbox to show newly arrived e-ticket
+      setOpen(true);
     }
   }, [bookings, activeEmail]);
 

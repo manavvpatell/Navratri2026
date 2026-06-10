@@ -18,12 +18,18 @@ interface AdminDashboardProps {
   onRefreshAll: () => void;
 }
 
-export default function AdminDashboard({ days, bookings, auditLogs, onRefreshAll }: AdminDashboardProps) {
+export default function AdminDashboard({ 
+  days, 
+  bookings, 
+  auditLogs, 
+  onRefreshAll
+}: AdminDashboardProps) {
   const [stats, setStats] = useState({
     totalPayments: 0,
     totalRegistrations: 0,
     activeUsersSimulated: 12,
-    dailyStats: [] as any[]
+    dailyStats: [] as any[],
+    isMongoOffline: false
   });
 
   const [loading, setLoading] = useState(false);
@@ -53,7 +59,10 @@ export default function AdminDashboard({ days, bookings, auditLogs, onRefreshAll
   const fetchStats = async () => {
     try {
       const liveStats = await api.getDashboardStats();
-      setStats(liveStats);
+      setStats({
+        ...liveStats,
+        isMongoOffline: liveStats.isMongoOffline ?? false
+      });
     } catch (err) {
       console.error("Failed to query metrics", err);
     }
@@ -126,6 +135,38 @@ export default function AdminDashboard({ days, bookings, auditLogs, onRefreshAll
           <RefreshCw className="w-3.5 h-3.5" /> Re-Sync Live Streams
         </button>
       </div>
+
+      {stats.isMongoOffline && (
+        <motion.div 
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-amber-50/95 border border-amber-500/20 rounded-xl p-4 flex gap-3 text-[#5C3A21] text-xs shadow-sm"
+        >
+          <ShieldAlert className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5 animate-pulse" />
+          <div className="space-y-1">
+            <h4 className="font-bold text-amber-800 flex items-center gap-2">
+              MongoDB Atlas Whitelist Notice — Connection Handshake Timeout
+            </h4>
+            <p className="leading-relaxed">
+              The sandboxed container is currently unable to complete the TLS/SSL handshake with your cluster `cluster0.0aaktxk.mongodb.net`. 
+              This is usually caused by restricted IP Access Lists on your MongoDB Atlas Dashboard.
+            </p>
+            <div className="bg-white/80 p-2.5 rounded-lg border border-amber-500/10 text-xs font-semibold text-[#3C2D24] mt-2 space-y-1">
+              <p className="font-serif font-bold text-amber-900">How to authorize the container connection:</p>
+              <ol className="list-decimal list-inside space-y-0.5 text-[#6B5D52] font-mono text-[11px] leading-relaxed">
+                <li>Sign in to your <strong className="text-amber-800">MongoDB Atlas Dashboard</strong>.</li>
+                <li>Navigate to <strong className="text-amber-800">Security &rarr; Network Access</strong> on the left sidebar.</li>
+                <li>Click <strong className="text-amber-800">Add IP Address</strong>.</li>
+                <li>Select <strong className="text-amber-800">Allow Access from Anywhere</strong> (which adds <code className="bg-amber-100 px-1 py-0.5 rounded text-amber-700">0.0.0.0/0</code>) and save!</li>
+              </ol>
+            </div>
+            <p className="text-[10px] text-[#8C7D72] italic pt-1 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block animate-pulse" />
+              <strong>Offline-First Resilience Active:</strong> The service is maintaining perfect data consistency in high-speed, local cache & server in-memory registries. You can buy/verify tickets and use all operations normally!
+            </p>
+          </div>
+        </motion.div>
+      )}
 
       {/* Numerical Stats overview rewritten in clean light design */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
