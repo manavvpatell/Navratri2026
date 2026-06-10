@@ -5,8 +5,6 @@
 
 import { Booking, AuditLog, UserNotification, NavratriDay } from "../types";
 import { INITIAL_NAVRATRI_DAYS } from "./data";
-import { auth } from "./firebase";
-import { signInWithPopup, GoogleAuthProvider, signOut, User } from "firebase/auth";
 
 export enum OperationType {
   CREATE = 'create',
@@ -15,44 +13,6 @@ export enum OperationType {
   LIST = 'list',
   GET = 'get',
   WRITE = 'write',
-}
-
-export interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): never {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
-        providerId: provider.providerId,
-        email: provider.email,
-      })) || []
-    },
-    operationType,
-    path
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
 }
 
 class NavratriApiService {
@@ -97,13 +57,17 @@ class NavratriApiService {
     }
   }
 
-  async loginWithGoogle(): Promise<User> {
+  async loginWithGoogle(): Promise<any> {
     try {
-      const provider = new GoogleAuthProvider();
-      const credential = await signInWithPopup(auth, provider);
+      const mockUser = {
+        uid: "google-mock-id-" + Math.floor(Math.random() * 10000),
+        email: "guest_google@gmail.com",
+        displayName: "Google Festive Guest",
+        photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=GoogleGuest"
+      };
       // Create local log
-      await this.logActivity("AUTH_GOOGLE_SUCCESS", `Logged in successfully: ${credential.user.displayName}`, credential.user.email || "guest");
-      return credential.user;
+      await this.logActivity("AUTH_GOOGLE_SUCCESS", `Logged in successfully: ${mockUser.displayName}`, mockUser.email);
+      return mockUser;
     } catch (err) {
       console.error("Auth: Google login failed", err);
       throw err;
@@ -113,9 +77,9 @@ class NavratriApiService {
   async loginSimulated(role: "admin" | "user"): Promise<any> {
     const mockUser = role === "admin" ? {
       uid: "mock-admin-id",
-      email: "manavgameium@gmail.com",
-      displayName: "Manav Organizer",
-      photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=Manav"
+      email: "satrang2026@gmail.com",
+      displayName: "Satrang Admin",
+      photoURL: "https://api.dicebear.com/7.x/initials/svg?seed=Satrang"
     } : {
       uid: "mock-user-id",
       email: "guest@gmail.com",
@@ -134,8 +98,13 @@ class NavratriApiService {
 
   async logout(): Promise<void> {
     try {
-      const email = auth.currentUser?.email || "anonymous";
-      await signOut(auth);
+      const stored = localStorage.getItem("simulated_user");
+      let email = "anonymous";
+      if (stored) {
+        try {
+          email = JSON.parse(stored).email || "anonymous";
+        } catch (_) {}
+      }
       await this.logActivity("AUTH_LOGOUT", `Logged out user`, email);
     } catch (err) {
       console.error("Auth: Logout failed", err);

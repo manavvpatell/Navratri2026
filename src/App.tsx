@@ -9,8 +9,6 @@ import confetti from "canvas-confetti";
 import { 
   Calendar, MapPin, Sparkles, AlertCircle, ShieldCheck, Ticket, Bell, Settings, Eye, HelpCircle, Key, ChevronRight, Volume2, Info, Map, Megaphone, X, ShieldAlert
 } from "lucide-react";
-import { onAuthStateChanged } from "firebase/auth";
-import { auth } from "./lib/firebase";
 import { api } from "./lib/api";
 import { INITIAL_NAVRATRI_DAYS } from "./lib/data";
 import { Booking, AuditLog, UserNotification, NavratriDay } from "./types";
@@ -65,7 +63,7 @@ export default function App() {
   );
 
   // Intro splash screen state
-  const [showIntro, setShowIntro] = useState(true);
+  const [showIntro, setShowIntro] = useState(false);
   const introVideoRef = useRef<HTMLVideoElement>(null);
   const mainVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -120,27 +118,18 @@ export default function App() {
   useEffect(() => {
     loadInitialData();
 
-    // Listen to Firebase authentication state dynamically
-    const unsubscribeAuth = onAuthStateChanged(auth, (firebaseUser) => {
-      if (firebaseUser) {
-        setUser(firebaseUser);
-        setEmailInput(firebaseUser.email || "");
-        if (firebaseUser.displayName) {
-          setFullName(firebaseUser.displayName);
-        }
-      } else {
-        // Fallback to simulated local user if present
-        const storedSim = localStorage.getItem("simulated_user");
-        if (storedSim) {
-          const parsed = JSON.parse(storedSim);
-          setUser(parsed);
-          setEmailInput(parsed.email || "");
-          setFullName(parsed.displayName || "");
-        } else {
-          setUser(null);
-        }
-      }
-    });
+    // Sync local authenticated user profile if present
+    const storedSim = localStorage.getItem("simulated_user");
+    if (storedSim) {
+      try {
+        const parsed = JSON.parse(storedSim);
+        setUser(parsed);
+        setEmailInput(parsed.email || "");
+        setFullName(parsed.displayName || "");
+      } catch (_) {}
+    } else {
+      setUser(null);
+    }
 
     // Establish persistent SSE Stream link for zero-downtime updates
     const stream = api.connectSseStream(
@@ -204,7 +193,6 @@ export default function App() {
 
     return () => {
       stream.close();
-      unsubscribeAuth();
       if (announcementTimeoutRef.current) clearTimeout(announcementTimeoutRef.current);
     };
   }, []);

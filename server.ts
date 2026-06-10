@@ -11,11 +11,10 @@ import dotenv from "dotenv";
 
 import { Booking, AuditLog, UserNotification, NavratriDay } from "./src/types";
 import { INITIAL_NAVRATRI_DAYS } from "./src/lib/data";
-import { getMongoDb, seedMongoDatabase, isMongoDbOffline, setMongoDbOffline } from "./mongo-db";
 
 dotenv.config();
 
-// In-Memory fallback buffers (to support absolute zero-downtime offline capabilities)
+// In-Memory buffers
 let daysData: NavratriDay[] = [...INITIAL_NAVRATRI_DAYS];
 let bookings: Booking[] = [];
 let auditLogs: AuditLog[] = [];
@@ -30,6 +29,43 @@ let notifications: UserNotification[] = [
     read: false
   }
 ];
+
+// Persistent File-Based DB Helper for absolute zero-downtime offline capabilities
+const DB_PATH = path.join(process.cwd(), "db.json");
+
+function loadDb() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const raw = fs.readFileSync(DB_PATH, "utf-8");
+      const data = JSON.parse(raw);
+      if (data.daysData) daysData = data.daysData;
+      if (data.bookings) bookings = data.bookings;
+      if (data.auditLogs) auditLogs = data.auditLogs;
+      if (data.usersRegisterCache) usersRegisterCache = data.usersRegisterCache;
+      if (data.notifications) notifications = data.notifications;
+      console.log(`[JSON_DB] Successfully loaded state from db.json.`);
+    } else {
+      saveDb();
+    }
+  } catch (err) {
+    console.warn("[JSON_DB] Failed to load db.json, running with memory structures:", err);
+  }
+}
+
+function saveDb() {
+  try {
+    const data = {
+      daysData,
+      bookings,
+      auditLogs,
+      usersRegisterCache,
+      notifications
+    };
+    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("[JSON_DB] Failed to save db.json:", err);
+  }
+}
 
 // Server-Sent Events client registry
 interface SSEClient {
@@ -58,7 +94,7 @@ function generateTicketHash(orderId: string, dayNum: number, email: string): str
   return hash.substring(0, 48);
 }
 
-// Global logger helper connecting to MongoDB
+// Global logger helper
 async function addAuditLog(level: "info" | "warning" | "error" | "security", event: string, details: string, email: string = "system") {
   const log: AuditLog = {
     id: "LOG-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
@@ -69,16 +105,11 @@ async function addAuditLog(level: "info" | "warning" | "error" | "security", eve
     email
   };
 
-  if (!isMongoDbOffline()) {
-    try {
-      const mdb = await getMongoDb();
-      await mdb.collection("audit_logs").insertOne(log);
-    } catch (err) {
-      auditLogs.unshift(log);
-    }
-  } else {
-    auditLogs.unshift(log);
+  auditLogs.unshift(log);
+  if (auditLogs.length > 250) {
+    auditLogs = auditLogs.slice(0, 250);
   }
+  saveDb();
 
   broadcastSSE("audit_log", log);
   console.log(`[AUDIT LOG] [${level.toUpperCase()}] [${event}] : ${details} (${email})`);
@@ -99,34 +130,8 @@ async function startServer() {
     next();
   });
 
-  // Connect to MongoDB and seed capacity_state collection with default nights
-  await seedMongoDatabase();
-
-  // Load existing bookings and logs from MongoDB to pre-populate caches
-  const preloadCollections = async () => {
-    try {
-      const mdb = await getMongoDb();
-      const loadedBookings = await mdb.collection("bookings").find({}).toArray();
-      bookings = loadedBookings as any;
-      console.log(`[BOOTSTRAP-MONGO] Preloaded ${bookings.length} bookings from MongoDB.`);
-
-      const loadedLogs = await mdb.collection("audit_logs").find({}).sort({ timestamp: -1 }).limit(100).toArray();
-      auditLogs = loadedLogs as any;
-      console.log(`[BOOTSTRAP-MONGO] Preloaded ${auditLogs.length} audit logs from MongoDB.`);
-
-      const loadedNotifs = await mdb.collection("notifications").find({}).toArray();
-      if (loadedNotifs.length > 0) {
-        notifications = loadedNotifs as any;
-      }
-
-      const loadedUsers = await mdb.collection("users").find({}).toArray();
-      usersRegisterCache = loadedUsers as any;
-      console.log(`[BOOTSTRAP-MONGO] Preloaded ${usersRegisterCache.length} users from MongoDB.`);
-    } catch (err) {
-      console.warn("[BOOTSTRAP-MONGO] Direct preloading skipped or offline fallback active: ", err);
-    }
-  };
-  await preloadCollections();
+  // Load database structures on startup
+  loadDb();
 
   // --- API ROUTING SECTION ---
 
@@ -147,23 +152,7 @@ async function startServer() {
     }
 
     try {
-      let isOffline = isMongoDbOffline();
-      let exists = false;
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          const existingUser = await mdb.collection("users").findOne({ email: trimmedEmail });
-          if (existingUser) exists = true;
-        } catch (err) {
-          console.warn("DB offline during registration check, relying on local cache", err);
-          isOffline = true;
-        }
-      }
-
-      if (!exists) {
-        exists = usersRegisterCache.some((u) => u.email === trimmedEmail);
-      }
+      const exists = usersRegisterCache.some((u) => u.email === trimmedEmail);
 
       if (exists) {
         return res.status(400).json({ success: false, message: "An account with this email address already exists." });
@@ -177,16 +166,9 @@ async function startServer() {
         createdAt: new Date().toISOString()
       };
 
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          await mdb.collection("users").insertOne(newUser);
-        } catch (err) {
-          console.warn("DB offline during registration save, saving in memory cache only", err);
-        }
-      }
-
       usersRegisterCache.push(newUser);
+      saveDb();
+
       await addAuditLog("info", "USER_REGISTERED", `New user successfully registered: ${name} (${trimmedEmail})`, trimmedEmail);
 
       res.json({
@@ -241,22 +223,7 @@ async function startServer() {
 
     // Normal User Login
     try {
-      let isOffline = isMongoDbOffline();
-      let matchUser: any = null;
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          matchUser = await mdb.collection("users").findOne({ email: trimmedEmail });
-        } catch (err) {
-          console.warn("DB offline during login check, relying on local cache", err);
-          isOffline = true;
-        }
-      }
-
-      if (!matchUser) {
-        matchUser = usersRegisterCache.find((u) => u.email === trimmedEmail);
-      }
+      const matchUser = usersRegisterCache.find((u) => u.email === trimmedEmail);
 
       if (!matchUser) {
         return res.status(401).json({ success: false, message: "No user account found with this email. Please register first." });
@@ -319,20 +286,6 @@ async function startServer() {
 
   // Retrieve current days parameters and capacities
   app.get("/api/days", async (req, res) => {
-    if (isMongoDbOffline()) {
-      return res.json(daysData);
-    }
-    try {
-      const mdb = await getMongoDb();
-      const list = await mdb.collection("capacity_state").find({}).toArray();
-      if (list.length > 0) {
-        list.sort((a, b) => a.day - b.day);
-        daysData = list as any; // Update in-memory cache
-        return res.json(list);
-      }
-    } catch (err) {
-      // Suppress connection warning outputs to prevent telemetry log pollution
-    }
     res.json(daysData);
   });
 
@@ -353,23 +306,7 @@ async function startServer() {
     const dayNum = parseInt(day);
 
     try {
-      let selectedDay: NavratriDay | undefined;
-      let isOffline = isMongoDbOffline();
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          selectedDay = await mdb.collection("capacity_state").findOne({ day: dayNum }) as any;
-        } catch (dbErr) {
-          console.warn("DB offline during create-order, resorting to memory fallback", dbErr);
-          isOffline = true;
-        }
-      }
-
-      if (isOffline || !selectedDay) {
-        // Fallback to in-memory days list (daysData)
-        selectedDay = daysData.find(d => d.day === dayNum);
-      }
+      const selectedDay = daysData.find(d => d.day === dayNum);
 
       if (!selectedDay) {
         return res.status(404).json({ success: false, message: `Descriptive Navratri Day [${dayNum}] does not exist.` });
@@ -398,21 +335,13 @@ async function startServer() {
         createdAt: new Date().toISOString()
       };
 
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          await mdb.collection("bookings").insertOne(newBooking);
-        } catch (dbErr) {
-          console.warn("Failed to write pending booking to DB, saving in-memory only", dbErr);
-        }
-      }
-
       bookings.push(newBooking); // Sync backup in-memory registry always!
+      saveDb();
 
       await addAuditLog(
         "info",
         "PAYMENT_ORDER_CREATED",
-        `Initiated pass checkout for ${name} (Day ${dayNum} - ${selectedDay.devi}) - Order ID: ${orderId} [${isOffline ? "MEMORY_FALLBACK" : "MONGO_ACTIVE"}]`,
+        `Initiated pass checkout for ${name} (Day ${dayNum} - ${selectedDay.devi}) - Order ID: ${orderId}`,
         email
       );
 
@@ -422,7 +351,7 @@ async function startServer() {
         amount,
         currency: "INR",
         dayDetails: selectedDay,
-        isMongoOffline: isOffline
+        isMongoOffline: true
       });
 
     } catch (err: any) {
@@ -436,21 +365,7 @@ async function startServer() {
     const { orderId, paymentId, signature, status } = req.body;
 
     try {
-      let booking = bookings.find(b => b.orderId === orderId);
-      let isOffline = isMongoDbOffline();
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          const dbBooking = await mdb.collection("bookings").findOne({ orderId: orderId }) as any;
-          if (dbBooking) {
-            booking = dbBooking;
-          }
-        } catch (dbErr) {
-          console.warn("DB offline during verification find, using cache", dbErr);
-          isOffline = true;
-        }
-      }
+      const booking = bookings.find(b => b.orderId === orderId);
 
       if (!booking) {
         await addAuditLog("error", "PAYMENT_VERIFICATION_ORPHANED", `Received transaction signature for unknown order reference: ${orderId}`, "unknown");
@@ -463,67 +378,22 @@ async function startServer() {
 
       if (status === "failed") {
         booking.status = "failed";
-        if (!isOffline) {
-          try {
-            const mdb = await getMongoDb();
-            await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: { status: "failed" } });
-          } catch (dbErr) {
-            console.warn("Could not sync failed status to Mongo, cache updated", dbErr);
-          }
-        }
+        saveDb();
         await addAuditLog("warning", "PAYMENT_FAILED", `Garba pass checkout failed or aborted at gateway for order ID: ${orderId}`, booking.email);
         return res.json({ success: false, message: "Payment checkout was canceled or failed authorization." });
       }
 
       // Execute high-speed atomic capacity locks dynamically
       let targetDay: NavratriDay | null = null;
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          const capacityUpdate = await mdb.collection("capacity_state").findOneAndUpdate(
-            { 
-              day: booking.day,
-              $expr: { $lt: ["$currentCapacity", "$maxCapacity"] } 
-            },
-            { 
-              $inc: { currentCapacity: 1 } 
-            },
-            { 
-              returnDocument: "after" 
-            }
-          );
-
-          if (capacityUpdate && "value" in capacityUpdate && capacityUpdate.value) {
-            targetDay = capacityUpdate.value as any;
-          } else if (capacityUpdate && !("value" in capacityUpdate)) {
-            targetDay = capacityUpdate as any;
-          }
-        } catch (dbErr) {
-          console.warn("Could not execute Mongo atomic capacity update, falling back to memory", dbErr);
-          isOffline = true;
-        }
-      }
-
-      // Fallback to local memory capacity if MongoDB fails
-      if (isOffline || !targetDay) {
-        const memDayObj = daysData.find(d => d.day === booking!.day);
-        if (memDayObj && memDayObj.currentCapacity < memDayObj.maxCapacity) {
-          memDayObj.currentCapacity += 1;
-          targetDay = memDayObj;
-        }
+      const memDayObj = daysData.find(d => d.day === booking.day);
+      if (memDayObj && memDayObj.currentCapacity < memDayObj.maxCapacity) {
+        memDayObj.currentCapacity += 1;
+        targetDay = memDayObj;
       }
 
       if (!targetDay) {
         booking.status = "failed";
-        if (!isOffline) {
-          try {
-            const mdb = await getMongoDb();
-            await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: { status: "failed" } });
-          } catch (dbErr) {
-            console.warn("Failed to mark booking failed in MongoDB", dbErr);
-          }
-        }
+        saveDb();
         await addAuditLog("security", "RACE_CONDITION_BLOCKED", `Blocked ticket issuance during signature verification - Day ${booking.day} sold out mid-payment`, booking.email);
         return res.status(400).json({ success: false, message: "We apologize! Capacity maximum limit reached during payment authorization. Refund initiated." });
       }
@@ -539,15 +409,6 @@ async function startServer() {
         isScanned: false
       };
 
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          await mdb.collection("bookings").updateOne({ id: booking.id }, { $set: updatedBooking });
-        } catch (dbErr) {
-          console.warn("Could not sync confirmed booking to MongoDB", dbErr);
-        }
-      }
-
       // Sync master bookings in-memory cache
       const bIdx = bookings.findIndex(b => b.id === updatedBooking.id || b.orderId === updatedBooking.orderId);
       if (bIdx !== -1) {
@@ -555,6 +416,7 @@ async function startServer() {
       } else {
         bookings.push(updatedBooking);
       }
+      saveDb();
 
       // Broadcast booking update dynamically to all listening devices
       broadcastSSE("booking_update", updatedBooking);
@@ -575,16 +437,8 @@ async function startServer() {
         read: false
       };
 
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          await mdb.collection("notifications").insertOne(newNotification);
-        } catch (dbErr) {
-          console.warn("Failed to insert notification into DB, broadcasting only", dbErr);
-        }
-      } else {
-        notifications.unshift(newNotification);
-      }
+      notifications.unshift(newNotification);
+      saveDb();
       broadcastSSE("notification", newNotification);
 
       // Audit confirmed transaction
@@ -599,7 +453,7 @@ async function startServer() {
         success: true,
         booking: updatedBooking,
         dayDetails: targetDay,
-        isMongoOffline: isOffline
+        isMongoOffline: true
       });
 
     } catch (err: any) {
@@ -610,13 +464,7 @@ async function startServer() {
 
   // Retrieve all database bookings
   app.get("/api/bookings", async (req, res) => {
-    try {
-      const mdb = await getMongoDb();
-      const list = await mdb.collection("bookings").find({}).toArray();
-      res.json(list);
-    } catch (err) {
-      res.json(bookings);
-    }
+    res.json(bookings);
   });
 
   // Client simulated/google logging endpoint
@@ -632,69 +480,34 @@ async function startServer() {
 
   // Retrieve security logs
   app.get("/api/logs", async (req, res) => {
-    try {
-      const mdb = await getMongoDb();
-      const list = await mdb.collection("audit_logs").find({}).sort({ timestamp: -1 }).limit(60).toArray();
-      res.json(list);
-    } catch (err) {
-      res.json(auditLogs);
-    }
+    res.json(auditLogs);
   });
 
   // Calculate live statistics
   app.get("/api/stats", async (req, res) => {
-    try {
-      const mdb = await getMongoDb();
-      const bookingsList = await mdb.collection("bookings").find({ status: "success" }).toArray() as any[];
-      const daysList = await mdb.collection("capacity_state").find({}).toArray() as any[];
+    // In-Memory Fallback
+    const totalPayments = bookings
+      .filter((b) => b.status === "success")
+      .reduce((sum, b) => sum + b.amount, 0);
 
-      const totalPayments = bookingsList.reduce((sum, b) => sum + b.amount, 0);
-      const totalRegistrations = bookingsList.length;
+    const totalRegistrations = bookings.filter((b) => b.status === "success").length;
 
-      daysList.sort((a, b) => a.day - b.day);
+    const dailyStats = daysData.map((d) => ({
+      day: d.day,
+      devi: d.devi,
+      sold: d.currentCapacity,
+      max: d.maxCapacity,
+      revenue: bookings
+        .filter((b) => b.status === "success" && b.day === d.day)
+        .reduce((sum, b) => sum + b.amount, 0)
+    }));
 
-      const dailyStats = daysList.map((d) => ({
-        day: d.day,
-        devi: d.devi,
-        sold: d.currentCapacity,
-        max: d.maxCapacity,
-        revenue: bookingsList
-          .filter((b) => b.day === d.day)
-          .reduce((sum, b) => sum + b.amount, 0)
-      }));
-
-      res.json({
-        totalPayments,
-        totalRegistrations,
-        dailyStats,
-        activeUsersSimulated: Math.max(12, sseClients.length + 8)
-      });
-
-    } catch (err) {
-      // In-Memory Fallback
-      const totalPayments = bookings
-        .filter((b) => b.status === "success")
-        .reduce((sum, b) => sum + b.amount, 0);
-
-      const totalRegistrations = bookings.filter((b) => b.status === "success").length;
-
-      const dailyStats = daysData.map((d) => ({
-        day: d.day,
-        devi: d.devi,
-        sold: d.currentCapacity,
-        max: d.maxCapacity,
-        revenue: bookings
-          .filter((b) => b.status === "success" && b.day === d.day)
-          .reduce((sum, b) => sum + b.amount, 0)
-      }));
-
-      res.json({
-        totalPayments,
-        totalRegistrations,
-        dailyStats,
-        activeUsersSimulated: Math.max(8, sseClients.length + 5)
-      });
-    }
+    res.json({
+      totalPayments,
+      totalRegistrations,
+      dailyStats,
+      activeUsersSimulated: Math.max(8, sseClients.length + 5)
+    });
   });
 
   // Broadcast push notifications
@@ -713,26 +526,12 @@ async function startServer() {
       read: false
     };
 
-    let isOffline = isMongoDbOffline();
-
-    if (!isOffline) {
-      try {
-        const mdb = await getMongoDb();
-        await mdb.collection("notifications").insertOne(newNotification);
-      } catch (err: any) {
-        console.error("Announcement write error: ", err);
-        isOffline = true;
-      }
-    }
-
-    // Always keep in sync with local memory list
-    if (isOffline || !notifications.some(n => n.id === newNotification.id)) {
-      notifications.unshift(newNotification);
-    }
+    notifications.unshift(newNotification);
+    saveDb();
 
     broadcastSSE("notification", newNotification);
     await addAuditLog("security", "ADMIN_BROADCAST", `Admin broadcasted venue announcement: "${title}"`, "admin@navratri2026.com");
-    res.json({ success: true, notification: newNotification, isMongoOffline: isOffline });
+    res.json({ success: true, notification: newNotification, isMongoOffline: true });
   });
 
   // Gate Scanner - Validates a unique ticket QR code hash
@@ -740,26 +539,7 @@ async function startServer() {
     const { qrHash } = req.body;
 
     try {
-      let match: Booking | undefined;
-      let isOffline = isMongoDbOffline();
-
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          const dbMatch = await mdb.collection("bookings").findOne({ ticketHash: qrHash }) as any;
-          if (dbMatch) {
-            match = dbMatch;
-          }
-        } catch (dbErr) {
-          console.warn("DB offline during QR code lookup", dbErr);
-          isOffline = true;
-        }
-      }
-
-      // Fallback: look up in local cache
-      if (!match) {
-        match = bookings.find(b => b.ticketHash === qrHash);
-      }
+      const match = bookings.find(b => b.ticketHash === qrHash);
 
       if (!match) {
         await addAuditLog("warning", "INVALID_QR_SCAN", `Gate check attempted with unrecognized QR Hash: ${qrHash}`, "gate_scanner");
@@ -774,20 +554,12 @@ async function startServer() {
       // Check-in
       match.isScanned = true;
 
-      if (!isOffline) {
-        try {
-          const mdb = await getMongoDb();
-          await mdb.collection("bookings").updateOne({ id: match.id }, { $set: { isScanned: true } });
-        } catch (dbErr) {
-          console.warn("Failed to sync scanned status to MongoDB", dbErr);
-        }
-      }
-
       // Sync booking status in our cache
-      const bIdx = bookings.findIndex(b => b.id === match!.id);
+      const bIdx = bookings.findIndex(b => b.id === match.id);
       if (bIdx !== -1) {
         bookings[bIdx] = match;
       }
+      saveDb();
 
       await addAuditLog("info", "GATE_TICKET_VALIDATED", `Ticket confirmation ID ${match.id} (Day ${match.day} - ${match.name}) successfully authorized for entrance.`, "gate_scanner");
 
@@ -795,7 +567,7 @@ async function startServer() {
         success: true,
         message: "Pass fully validated. Welcome to Navratri 2026!",
         booking: match,
-        isMongoOffline: isOffline
+        isMongoOffline: true
       });
 
     } catch (err) {
