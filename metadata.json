@@ -1,0 +1,6 @@
+{
+  "name": "Navratri Garba Pass Booking System",
+  "description": "Secure Garba Pass reservation portal for Navratri 2026, featuring real-time capacities, Razorpay mock checkout, gate scanning controls, and email QR ticket notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

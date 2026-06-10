@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net - Default Deny to enforce Zero-Trust access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Common global helper primitives
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Dynamic supervisor bootstrap helper (based on system email metadata)
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'manavgameium@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Bookings collection security standard
+    match /bookings/{bookingId} {
+      allow get: if true; // Public check-in verification or receipt download
+      allow list: if isSignedIn() && (
+        resource.data.email == request.auth.token.email || 
+        isAdmin()
+      );
+      
+      // Creating a booking can be done as anonymous/guest or signed-in user, but needs precise validation
+      allow create: if isValidBooking(incoming()) && (
+        incoming().id == bookingId
+      );
+      
+      // Updates represent specific transactional operations: scanning by admin or updating transaction details
+      allow update: if isValidBooking(incoming()) && (
+        // Admin scan validation
+        (isScanAction() && isAdmin()) ||
+        // Payment confirmation update: only status and signatures modify
+        (isPaymentVerificationAction() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentId', 'paymentSignature', 'isScanned']))
+      );
+    }
+
+    // Helper functions for Booking entity
+    function isValidBooking(data) {
+      return data.keys().hasAll(['id', 'name', 'email', 'phone', 'day', 'ticketHash', 'status', 'amount', 'orderId', 'createdAt']) &&
+             data.keys().size() <= 13 &&
+             data.id is string && data.id.size() <= 100 &&
+             data.name is string && data.name.size() <= 150 &&
+             data.email is string && data.email.size() <= 200 &&
+             data.phone is string && data.phone.size() <= 50 &&
+             data.day is int && data.day >= 1 && data.day <= 9 &&
+             data.ticketHash is string && data.ticketHash.size() <= 256 &&
+             data.status in ['pending', 'success', 'failed'] &&
+             data.amount is number && data.amount > 0 &&
+             data.orderId is string && data.orderId.size() <= 100;
+    }
+
+    function isScanAction() {
+      return incoming().diff(existing()).affectedKeys().hasOnly(['isScanned']) &&
+             incoming().isScanned == true;
+    }
+
+    function isPaymentVerificationAction() {
+      return existing().status == 'pending' &&
+             incoming().status in ['success', 'failed'];
+    }
+
+    // Audit logs are strictly WRITE-ONLY from standard users (No list/update/delete allowed from client SDKs)
+    match /audit_logs/{logId} {
+      allow create: if isValidAuditLog(incoming()) && incoming().id == logId;
+      allow get, list: if isSignedIn() && isAdmin();
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['id', 'timestamp', 'level', 'event', 'details', 'email']) &&
+             data.keys().size() == 6 &&
+             data.id is string && data.id.size() <= 128 &&
+             data.level in ['info', 'warning', 'error', 'security'] &&
+             data.event is string && data.event.size() <= 100 &&
+             data.details is string && data.details.size() <= 4000 &&
+             data.email is string && data.email.size() <= 200;
+    }
+
+    // Capacity state of Garba halls/dates
+    match /capacity_state/{dayId} {
+      allow read: if true; // Publicly readable for real-time ticket availability
+      // Admin only can configure or reset capacities
+      allow write: if isSignedIn() && isAdmin();
+    }
+
+    // Notifications feed
+    match /notifications/{notificationId} {
+      allow read: if true; // Real-time client updates
+      allow write: if isSignedIn() && isAdmin();
+    }
+
+    // Admin role repository
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if false; // System bootstrap managed only
+    }
+  }
+}
